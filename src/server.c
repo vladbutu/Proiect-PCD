@@ -17,17 +17,16 @@
 
 #include "net_server.h" // server_cfg_t + net_server_run(),  bucla poll()
 #include "video_ops.h" // video_ctx_t + video_init() 
+#include "getopt_compat.h" // declaratii explicite getopt/optarg pentru clang-tidy
 
 #include <libconfig.h> // config_t, config_read_file etc
 
 #include <errno.h> // errno pt validari erori
-#include <getopt.h> // getopt pt parsare argumente linia de comanda
 #include <limits.h> // INT_MAX/INT_MIN pt validare overflow la strtol
 #include <stdint.h> // tipuri fixe (uint32_t etc.)
 #include <stdio.h> // fprintf, snprintf pt output/erori
 #include <stdlib.h> // EXIT_SUCCESS/EXIT_FAILURE, strtol, getenv
 #include <string.h> // snprintf, memset pt operatii string
-#include <unistd.h> // getopt, close
 
 #define DEFAULT_CONFIG_PATH  "config/server.conf" // calea implicita pt fisierul de configurare
 #define DEFAULT_PORT 18081 // portul implicit daca nu e in config
