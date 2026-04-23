@@ -11,49 +11,50 @@
  * - optiuni invalide sau lipsa pe linia de comanda
  * - fisier de configurare lipsa sau cu erori de sintaxa
  * - campuri lipsa in config (fallback pe valori implicite)
- * - conversie numerica esuata (strtol in loc de atoi)
+ * - conversie numerica esuata (strtol in loc de atoi, cert-err34-c)
  * - initializare libav esuata
  */
 
-#include "net_server.h" // server_cfg_t + net_server_run() -- bucla poll()
-#include "video_ops.h" // video_ctx_t + video_init() -- init FFmpeg
-#include "getopt_compat.h" // declaratii explicite getopt/optarg
+#include "net_server.h" // server_cfg_t + net_server_run(),  bucla poll()
+#include "video_ops.h" // video_ctx_t + video_init() 
 
-#include <libconfig.h> // config_t, config_read_file etc. -- lib extern obligatoriu
+#include <libconfig.h> // config_t, config_read_file etc
 
 #include <errno.h> // errno pt validari erori
+#include <getopt.h> // getopt pt parsare argumente linia de comanda
 #include <limits.h> // INT_MAX/INT_MIN pt validare overflow la strtol
 #include <stdint.h> // tipuri fixe (uint32_t etc.)
 #include <stdio.h> // fprintf, snprintf pt output/erori
 #include <stdlib.h> // EXIT_SUCCESS/EXIT_FAILURE, strtol, getenv
 #include <string.h> // snprintf, memset pt operatii string
+#include <unistd.h> // getopt, close
 
 #define DEFAULT_CONFIG_PATH  "config/server.conf" // calea implicita pt fisierul de configurare
 #define DEFAULT_PORT 18081 // portul implicit daca nu e in config
 #define DEFAULT_MAX_CLIENTS 64 // nr maxim de clienti concurenti
 #define DEFAULT_MAX_WORKERS 8 // nr maxim de workeri 
 #define DEFAULT_MERGE_PAR 4 // paralelism implicit la merge
-#define STRTOL_BASE_DEC 10 // baza 10 pt strtol, sa nu am magic number
+#define STRTOL_BASE_DEC 10 // baza 10 pt strtol
 #define STRERR_BUF_LEN 256 // buffer pt strerror_r
 
 // structura care grupeaza toate sursele de configurare
-// (evit parametri multipli cu tipuri usor de incurcat -- bugprone-easily-swappable-parameters)
+// evit parametri multipli cu tipuri usor de incurcat 
 typedef struct cli_opts {
     const char *config_path; // calea la fisierul libconfig
     int override_port; // port dat pe linia de comanda (0 = nu s-a dat)
     int verbose; // mod verbose (afiseaza info suplimentare pe stderr)
 } cli_opts_t;
 
-static void usage (const char *argv0)
+static void usage(const char *argv0)
 {
-    (void) fprintf ( stderr,
+    (void)fprintf(stderr,
         "T5 Video Processing Server\n"
         "Usage: %s [options]\n"
         "  -c <file> path to libconfig configuration (default: %s)\n"
         "  -p <port> override listen port from the config file\n"
-        "  -v        verbose logging to stderr\n"
-        "  -h        show this help message\n",
-        argv0, DEFAULT_CONFIG_PATH );
+        "  -v verbose logging to stderr\n"
+        "  -h show this help message\n",
+        argv0, DEFAULT_CONFIG_PATH);
 }
 
 // strtol in loc de atoi ca sa pot prinde erori de format/overflow
@@ -66,7 +67,8 @@ static int parse_int(const char *str, int fallback)
     char *end = NULL;
     errno = 0;
     long val = strtol(str, &end, STRTOL_BASE_DEC);
-    if (errno != 0 || end == str || *end != '\0' || val > INT_MAX || val < INT_MIN) {
+    if (errno != 0 || end == str || *end != '\0' ||
+        val > INT_MAX || val < INT_MIN) {
         return fallback;
     }
     return (int)val;
@@ -94,17 +96,18 @@ static int parse_cli(int argc, char **argv, cli_opts_t *out)
 // tine o pereche cheie + valoare implicita pt cautarile in config
 // (evit parametri multipli cu tipuri usor de incurcat)
 typedef struct str_field {
-    const char *key; // cheia din libconfig (ex: "storage.uploads_dir")
+    const char *key; // cheia din libconfig
     const char *fallback; // valoarea implicita daca cheia lipseste
-    char *dst; // bufferul destinatie unde copii valoarea
-    size_t dst_len; // dimensiunea bufferului destinatie
+    char *dst; // bufferul destinatie unde copiez valoarea
+    size_t dst_len; // dimensiunea maxima a bufferului destinatie
 } str_field_t;
 
 // cauta o cheie string in config; daca nu exista, pune valoarea implicita
 static void lookup_string_field(const config_t *cfg, const str_field_t *fld)
 {
     const char *value = NULL;
-    if (config_lookup_string(cfg, fld->key, &value) == CONFIG_TRUE && value != NULL) {
+    if (config_lookup_string(cfg, fld->key, &value) == CONFIG_TRUE
+        && value != NULL) {
         (void)snprintf(fld->dst, fld->dst_len, "%s", value);
     } else {
         (void)snprintf(fld->dst, fld->dst_len, "%s", fld->fallback);
@@ -118,7 +121,11 @@ static int load_config(const cli_opts_t *cli, server_cfg_t *scfg)
     config_init(&cfg);
 
     if (config_read_file(&cfg, cli->config_path) != CONFIG_TRUE) {
-        (void)fprintf(stderr, "config: %s:%d - %s\n", config_error_file(&cfg), config_error_line(&cfg), config_error_text(&cfg));
+        (void)fprintf(stderr,
+                      "config: %s:%d - %s\n",
+                      config_error_file(&cfg),
+                      config_error_line(&cfg),
+                      config_error_text(&cfg));
         config_destroy(&cfg);
         return -1;
     }
@@ -133,31 +140,19 @@ static int load_config(const cli_opts_t *cli, server_cfg_t *scfg)
     (void)config_lookup_int(&cfg, "server.max_workers", &max_workers);
     (void)config_lookup_int(&cfg, "server.merge_parallelism", &merge_par);
 
-    (void)max_workers; // citit din config dar inca nefolosit; va fi pt limitarea fork()-urilor
+    (void)max_workers; 
 
     scfg->listen_port = (cli->override_port > 0) ? cli->override_port : port;
     scfg->max_clients = max_clients;
     scfg->video.merge_parallelism = merge_par;
 
     str_field_t fields[] = {
-        {
-            "storage.uploads_dir",
-            "./data/uploads",
-            scfg->video.uploads_dir,
-            sizeof(scfg->video.uploads_dir),
-        },
-        {
-            "storage.outputs_dir",
-            "./data/outputs",
-            scfg->video.outputs_dir,
-            sizeof(scfg->video.outputs_dir),
-        },
-        {
-            "storage.ffmpeg_binary",
-            "/usr/bin/ffmpeg",
-            scfg->video.ffmpeg_binary,
-            sizeof(scfg->video.ffmpeg_binary),
-        },
+        { "storage.uploads_dir", "./data/uploads",
+          scfg->video.uploads_dir,sizeof(scfg->video.uploads_dir)   },
+        { "storage.outputs_dir", "./data/outputs",
+          scfg->video.outputs_dir, sizeof(scfg->video.outputs_dir)   },
+        { "storage.ffmpeg_binary", "/usr/bin/ffmpeg",
+          scfg->video.ffmpeg_binary, sizeof(scfg->video.ffmpeg_binary) },
     };
     for (size_t ix = 0; ix < sizeof(fields) / sizeof(fields[0]); ix++) {
         lookup_string_field(&cfg, &fields[ix]);
@@ -189,7 +184,7 @@ int main(int argc, char **argv)
         // afisez informatii mediu; getenv("USER") e safe aici pt ca suntem
         // inca in faza single-threaded, inainte de fork()
         // (secure_getenv ar fi preferabil dar nu e portabil)
-        const char *user = getenv("USER");           /* NOLINT */
+        const char *user = getenv("USER"); /* NOLINT */
         if (user != NULL) {
             (void)fprintf(stderr, "vps_server: running as user=%s\n", user);
         }
@@ -206,9 +201,16 @@ int main(int argc, char **argv)
 /*
  *> Compilare si exemple de rulare:
  *
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ make all
+ * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ make clean && make all
+ * rm -rf build bin
  * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude -c src/server.c -o build/server.o
- * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude build/server.o build/net_server.o build/proto.o build/video_ops.o build/worker.o -o bin/vps_server -lconfig -lavformat -lavcodec -lavutil -lavfilter
+ * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude -c src/net_server.c -o build/net_server.o
+ * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude -c src/proto.c -o build/proto.o
+ * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude -c src/video_ops.c -o build/video_ops.o
+ * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude -c src/worker.c -o build/worker.o
+ * gcc ... build/server.o build/net_server.o ... -o bin/vps_server -lconfig -lavformat -lavcodec -lavutil -lavfilter
+ * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude -c src/client.c -o build/client.o
+ * gcc ... build/client.o build/proto.o -o bin/vps_client
  *
  * --- Rulare cu succes ---
  * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ bin/vps_server -h
@@ -219,12 +221,10 @@ int main(int argc, char **argv)
  *   -v         verbose logging to stderr
  *   -h         show this help message
  *
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ nohup bin/vps_server -v >/tmp/final_vps_server.log 2>&1 &
- * [1] 19224
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ head -3 /tmp/final_vps_server.log
- * nohup: ignoring input
+ * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ bin/vps_server -v
  * vps_server: port=18081 max_clients=64 merge_par=4 ffmpeg=/usr/bin/ffmpeg
  * vps_server: running as user=vladb
+ * vps_server: listening on port 18081 (max_clients=64)
  *
  * --- Rulare cu esec ---
  * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ bin/vps_server -c /tmp/inexistent.conf
