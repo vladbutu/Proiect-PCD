@@ -1,0 +1,580 @@
+openapi: "3.0.3"
+
+info:
+  title: Video Processing Server (VPS) — Binary + REST Shim
+  version: "1.0.0"
+  description: |
+    Specificatie OpenAPI pentru protocolul VPS.
+
+    VPS are doua moduri de acces:
+    1) protocol binar custom peste TCP (port 18081)
+    2) REST shim HTTP minimal (port 18082) peste acelasi motor de procesare
+
+    Aceasta specificatie documenteaza ambele moduri pentru a acoperi integral
+    contractul client–server folosit in proiect.
+
+    Fiecare mesaj TCP incepe cu un header binar de 16 bytes (network byte order):
+    `msg_size(4B) | client_id(4B) | op_id(4B) | task_id(4B)`
+
+    Urmat de un payload specific operatiei.
+
+    Dimensiuni payload (fara header):
+    - OPR_TRIM: 1032 bytes (4+4+512+512)
+    - OPR_FILTER: 1088 bytes (64+512+512)
+    - OPR_MERGE: 8772 bytes (4+64+512+16×512)
+    - OPR_MIXAUDIO: 1536 bytes (512+512+512)
+    - OPR_STATUS/RESULT: 520 bytes (4+4+512)
+
+    PROTO_MAX_MSG = 4096 bytes (limita buffer mesaje simple; MERGE depaseste aceasta valoare).
+
+    Echipa 11 · IR3 2026 · Proiect PCD
+  contact:
+    name: Echipa 11
+
+servers:
+  - url: tcp://127.0.0.1:18081
+    description: Server local implicit (port configurabil in server.conf)
+  - url: http://127.0.0.1:18082
+    description: REST shim minimal (vps_rest)
+
+paths:
+  /health:
+    get:
+      operationId: restHealth
+      summary: Verifica disponibilitatea REST shim
+      description: Endpoint HTTP disponibil pe portul REST (18082).
+      tags: [REST Shim]
+      responses:
+        "200":
+          description: Serviciul REST este disponibil
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestOkResponse"
+
+  /connect:
+    post:
+      operationId: oprConnect
+      summary: Handshake — obtine un client_id de la server
+      description: |
+        Clientul trimite un header cu op_id=0 (OPR_CONNECT).
+        Serverul raspunde cu acelasi header dar cu client_id populat
+        (generat ca PID XOR socket fd).
+      tags: [Session]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              $ref: "#/components/schemas/ProtoHeader"
+      responses:
+        "200":
+          description: Header cu client_id atribuit
+          content:
+            application/octet-stream:
+              schema:
+                $ref: "#/components/schemas/ProtoHeader"
+
+  /bye:
+    post:
+      operationId: oprBye
+      summary: Inchide sesiunea
+      description: |
+        Clientul trimite un header cu op_id=1 (OPR_BYE).
+        Serverul inchide conexiunea TCP.
+      tags: [Session]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              $ref: "#/components/schemas/ProtoHeader"
+      responses:
+        "200":
+          description: Conexiunea este inchisa de server
+
+  /trim:
+    post:
+      operationId: oprTrim
+      summary: Taie un segment dintr-un clip video
+      description: |
+        Mod TCP binar (port 18081):
+        - header cu op_id=2 (OPR_TRIM) + payload proto_trim_t
+        - raspuns binar proto_status_t
+
+        Mod REST shim (port 18082):
+        - POST /trim?input=...&output=...&start_ms=...&end_ms=...
+        - raspuns JSON cu status/output
+      tags: [Video Operations]
+      parameters:
+        - in: query
+          name: input
+          schema: { type: string, maxLength: 512 }
+          required: false
+        - in: query
+          name: output
+          schema: { type: string, maxLength: 512 }
+          required: false
+        - in: query
+          name: start_ms
+          schema: { type: integer, minimum: 0 }
+          required: false
+        - in: query
+          name: end_ms
+          schema: { type: integer, minimum: 0 }
+          required: false
+      requestBody:
+        required: false
+        content:
+          application/octet-stream:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ProtoHeader"
+                - $ref: "#/components/schemas/ProtoTrim"
+      responses:
+        "200":
+          description: Operatie reusita — clip trimmed
+          content:
+            application/octet-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ProtoHeader"
+                  - $ref: "#/components/schemas/ProtoStatus"
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestOkResponse"
+        "400":
+          description: Cerere invalida in modul REST
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestErrorResponse"
+        "500":
+          description: Eroare FFmpeg sau I/O
+
+  /filter:
+    post:
+      operationId: oprFilter
+      summary: Aplica un filtru video FFmpeg
+      description: |
+        Mod TCP binar (port 18081): header op_id=3 + proto_filter_t.
+        Mod REST shim (port 18082):
+        POST /filter?input=...&output=...&filter=...
+      tags: [Video Operations]
+      parameters:
+        - in: query
+          name: input
+          schema: { type: string, maxLength: 512 }
+          required: false
+        - in: query
+          name: output
+          schema: { type: string, maxLength: 512 }
+          required: false
+        - in: query
+          name: filter
+          schema: { type: string, maxLength: 64 }
+          required: false
+      requestBody:
+        required: false
+        content:
+          application/octet-stream:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ProtoHeader"
+                - $ref: "#/components/schemas/ProtoFilter"
+      responses:
+        "200":
+          description: Filtru aplicat cu succes
+          content:
+            application/octet-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ProtoHeader"
+                  - $ref: "#/components/schemas/ProtoStatus"
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestOkResponse"
+        "400":
+          description: Cerere invalida in modul REST
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestErrorResponse"
+        "500":
+          description: Eroare FFmpeg sau filtru invalid
+
+  /merge:
+    post:
+      operationId: oprMerge
+      summary: Concateneaza N clipuri video cu tranzitii
+      description: |
+        Mod TCP binar (port 18081): header op_id=4 + proto_merge_t.
+        Mod REST shim (port 18082):
+        POST /merge?output=...&transition=...&clips=a.mp4,b.mp4,c.mp4
+      tags: [Video Operations]
+      parameters:
+        - in: query
+          name: output
+          schema: { type: string, maxLength: 512 }
+          required: false
+        - in: query
+          name: transition
+          schema: { type: string, maxLength: 64 }
+          required: false
+        - in: query
+          name: clips
+          schema: { type: string }
+          description: Lista separata prin virgula (max 16 elemente)
+          required: false
+      requestBody:
+        required: false
+        content:
+          application/octet-stream:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ProtoHeader"
+                - $ref: "#/components/schemas/ProtoMerge"
+      responses:
+        "200":
+          description: Clipuri concatenate cu succes
+          content:
+            application/octet-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ProtoHeader"
+                  - $ref: "#/components/schemas/ProtoStatus"
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestOkResponse"
+        "400":
+          description: Cerere invalida in modul REST
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestErrorResponse"
+        "500":
+          description: Eroare la procesare segmente sau concat
+
+  /mixaudio:
+    post:
+      operationId: oprMixaudio
+      summary: Suprapune o pista audio pe un clip video
+      description: |
+        Mod TCP binar (port 18081): header op_id=5 + proto_mixaudio_t.
+        Mod REST shim (port 18082):
+        POST /mixaudio?input_video=...&input_audio=...&output=...
+      tags: [Video Operations]
+      parameters:
+        - in: query
+          name: input_video
+          schema: { type: string, maxLength: 512 }
+          required: false
+        - in: query
+          name: input_audio
+          schema: { type: string, maxLength: 512 }
+          required: false
+        - in: query
+          name: output
+          schema: { type: string, maxLength: 512 }
+          required: false
+      requestBody:
+        required: false
+        content:
+          application/octet-stream:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ProtoHeader"
+                - $ref: "#/components/schemas/ProtoMixaudio"
+      responses:
+        "200":
+          description: Audio mixat cu succes
+          content:
+            application/octet-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ProtoHeader"
+                  - $ref: "#/components/schemas/ProtoStatus"
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestOkResponse"
+        "400":
+          description: Cerere invalida in modul REST
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestErrorResponse"
+        "500":
+          description: Eroare FFmpeg
+
+  /status:
+    post:
+      operationId: oprStatus
+      summary: Interogheaza starea unui task
+      description: |
+        Header cu op_id=6 (OPR_STATUS) si task_id populat.
+        Serverul raspunde cu proto_status_t continand starea curenta.
+      tags: [Session]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              $ref: "#/components/schemas/ProtoHeader"
+      responses:
+        "200":
+          description: Starea taskului
+          content:
+            application/octet-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ProtoHeader"
+                  - $ref: "#/components/schemas/ProtoStatus"
+        "404":
+          description: task_id inexistent
+
+  /result:
+    post:
+      operationId: oprResult
+      summary: Obtine calea rezultatului unui task finalizat
+      description: |
+        Header cu op_id=7 (OPR_RESULT) si task_id populat.
+        Serverul raspunde cu proto_status_t care include result_path.
+      tags: [Session]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              $ref: "#/components/schemas/ProtoHeader"
+      responses:
+        "200":
+          description: Calea rezultatului
+          content:
+            application/octet-stream:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ProtoHeader"
+                  - $ref: "#/components/schemas/ProtoStatus"
+        "404":
+          description: task_id inexistent sau task nefinalizat
+
+components:
+  schemas:
+    ProtoHeader:
+      type: object
+      description: |
+        Header binar de 16 bytes. Toate campurile in network byte order (big-endian).
+        Trimis inaintea fiecarui payload.
+        Offset-uri: msg_size@0, client_id@4, op_id@8, task_id@12.
+      required: [msg_size, client_id, op_id, task_id]
+      x-binary-layout:
+        size: 16
+        fields:
+          - name: msg_size
+            offset: 0
+            size: 4
+            type: uint32_t (big-endian)
+          - name: client_id
+            offset: 4
+            size: 4
+            type: uint32_t (big-endian)
+          - name: op_id
+            offset: 8
+            size: 4
+            type: uint32_t (big-endian)
+          - name: task_id
+            offset: 12
+            size: 4
+            type: uint32_t (big-endian)
+      properties:
+        msg_size:
+          type: integer
+          format: uint32
+          minimum: 16
+          maximum: 4294967295
+          description: Dimensiune totala mesaj (header + payload) in bytes; minim 16 (header-only)
+          example: 1048
+        client_id:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: ID client atribuit de server la OPR_CONNECT (generat ca PID XOR fd)
+          example: 45231
+        op_id:
+          type: integer
+          format: uint32
+          description: "Cod operatie: 0=CONNECT, 1=BYE, 2=TRIM, 3=FILTER, 4=MERGE, 5=MIXAUDIO, 6=STATUS, 7=RESULT"
+          enum: [0, 1, 2, 3, 4, 5, 6, 7]
+          example: 2
+        task_id:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: Identificator task (0 pt operatii noi, >0 pt STATUS/RESULT/BYE)
+          example: 0
+
+    ProtoTrim:
+      type: object
+      description: "Payload OPR_TRIM (1032 bytes): taie clip de la start_ms la end_ms"
+      required: [start_ms, end_ms, input, output]
+      properties:
+        start_ms:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: Timp start in milisecunde
+          example: 1000
+        end_ms:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: Timp sfarsit in milisecunde
+          example: 5000
+        input:
+          type: string
+          maxLength: 512
+          description: Calea fisierului video de intrare
+          example: "data/uploads/clip.mp4"
+        output:
+          type: string
+          maxLength: 512
+          description: Calea fisierului video de iesire
+          example: "data/outputs/trimmed.mp4"
+
+    ProtoFilter:
+      type: object
+      description: "Payload OPR_FILTER (1088 bytes): aplica filtru FFmpeg"
+      required: [filter, input, output]
+      properties:
+        filter:
+          type: string
+          maxLength: 64
+          description: "Numele filtrului FFmpeg (ex: grayscale, blur, hflip)"
+          example: "grayscale"
+        input:
+          type: string
+          maxLength: 512
+          description: Calea fisierului video de intrare
+          example: "data/uploads/clip.mp4"
+        output:
+          type: string
+          maxLength: 512
+          description: Calea fisierului video de iesire
+          example: "data/outputs/filtered.mp4"
+
+    ProtoMerge:
+      type: object
+      description: "Payload OPR_MERGE (8772 bytes): concateneaza N clipuri (max 16) cu tranzitie"
+      required: [count, transition, output, clips]
+      properties:
+        count:
+          type: integer
+          format: uint32
+          description: Numarul de clipuri valide in lista (1–16)
+          minimum: 1
+          maximum: 16
+          example: 3
+        transition:
+          type: string
+          maxLength: 64
+          description: "Numele tranzitiei (ex: fade, none)"
+          example: "fade"
+        output:
+          type: string
+          maxLength: 512
+          description: Calea fisierului video de iesire (concat final)
+          example: "data/outputs/merged.mp4"
+        clips:
+          type: array
+          maxItems: 16
+          items:
+            type: string
+            maxLength: 512
+          description: Lista cailor clipurilor de concatenat
+          example:
+            - "data/uploads/clip1.mp4"
+            - "data/uploads/clip2.mp4"
+            - "data/uploads/clip3.mp4"
+
+    ProtoMixaudio:
+      type: object
+      description: "Payload OPR_MIXAUDIO (1536 bytes): suprapune audio pe video"
+      required: [input_video, input_audio, output]
+      properties:
+        input_video:
+          type: string
+          maxLength: 512
+          description: Calea fisierului video de intrare
+          example: "data/uploads/clip.mp4"
+        input_audio:
+          type: string
+          maxLength: 512
+          description: Calea fisierului audio de intrare
+          example: "data/uploads/music.mp3"
+        output:
+          type: string
+          maxLength: 512
+          description: Calea fisierului de iesire
+          example: "data/outputs/mixed.mp4"
+
+    ProtoStatus:
+      type: object
+      description: "Payload raspuns status (520 bytes): starea unui task"
+      required: [task_id, state, result_path]
+      properties:
+        task_id:
+          type: integer
+          format: uint32
+          description: ID-ul taskului
+          example: 1
+        state:
+          type: integer
+          format: int32
+          description: "Starea taskului: 0=in coada, 1=in executie, 2=terminat cu succes, -1=eroare"
+          enum: [-1, 0, 1, 2]
+          example: 2
+        result_path:
+          type: string
+          maxLength: 512
+          description: Calea absoluta a fisierului rezultat (populat cand state=2)
+          example: "data/outputs/trimmed.mp4"
+
+    RestOkResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          example: ok
+        service:
+          type: string
+          example: vps_rest
+        output:
+          type: string
+          maxLength: 512
+          example: data/outputs/rest_trimmed.mp4
+
+    RestErrorResponse:
+      type: object
+      required: [status, message]
+      properties:
+        status:
+          type: string
+          enum: [error]
+          example: error
+        message:
+          type: string
+          example: processing failed
+
+tags:
+  - name: Session
+    description: Operatii de management sesiune (connect, bye, status, result)
+  - name: Video Operations
+    description: Operatii de procesare video (trim, filter, merge, mixaudio)
+  - name: REST Shim
+    description: Endpoint-uri HTTP minimale (vps_rest) pentru demo WS/REST

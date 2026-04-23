@@ -1,0 +1,400 @@
+#%RAML 1.0
+title: Video Processing Server (VPS) — Binary + REST Shim
+version: v1.0.0
+baseUri: tcp://127.0.0.1:18081
+mediaType: application/octet-stream
+
+description: |
+  Specificatie RAML pentru protocolul VPS.
+
+  VPS are doua moduri de acces:
+  1) protocol binar custom peste TCP (port 18081)
+  2) REST shim HTTP minimal (port 18082)
+
+  Acest document acopera ambele moduri in acelasi contract.
+
+  Fiecare mesaj TCP incepe cu un header binar de 16 bytes (network byte order):
+  msg_size(4B) | client_id(4B) | op_id(4B) | task_id(4B)
+
+  Dimensiuni payload (fara header):
+  - OPR_TRIM:     1032 bytes (4+4+512+512)
+  - OPR_FILTER:   1088 bytes (64+512+512)
+  - OPR_MERGE:    8772 bytes (4+64+512+16x512)
+  - OPR_MIXAUDIO: 1536 bytes (512+512+512)
+  - OPR_STATUS/RESULT: 520 bytes (4+4+512)
+
+  PROTO_MAX_MSG = 4096 bytes (limita buffer mesaje simple; OPR_MERGE depaseste aceasta valoare).
+
+  Echipa 11 - IR3 2026 - Proiect PCD
+
+types:
+  ProtoHeader:
+    description: |
+      Header binar de 16 bytes. Toate campurile in network byte order (big-endian).
+      Offset-uri: msg_size@0, client_id@4, op_id@8, task_id@12.
+      Generat la OPR_CONNECT: client_id = PID XOR socket_fd.
+    properties:
+      msg_size:
+        type: integer
+        minimum: 16
+        maximum: 4294967295
+        description: Dimensiune totala mesaj (header + payload) in bytes; minim 16
+        example: 1048
+      client_id:
+        type: integer
+        minimum: 0
+        maximum: 4294967295
+        description: ID client atribuit de server la OPR_CONNECT (PID XOR fd)
+        example: 45231
+      op_id:
+        type: integer
+        description: "Cod operatie: 0=CONNECT, 1=BYE, 2=TRIM, 3=FILTER, 4=MERGE, 5=MIXAUDIO, 6=STATUS, 7=RESULT"
+        enum: [0, 1, 2, 3, 4, 5, 6, 7]
+        example: 2
+      task_id:
+        type: integer
+        minimum: 0
+        maximum: 4294967295
+        description: Identificator task (0 pt operatii noi, >0 pt STATUS/RESULT/BYE)
+        example: 0
+
+  ProtoTrim:
+    description: "Payload OPR_TRIM (1032 bytes): taie clip de la start_ms la end_ms"
+    properties:
+      start_ms:
+        type: integer
+        minimum: 0
+        maximum: 4294967295
+        description: Timp start in milisecunde
+        example: 1000
+      end_ms:
+        type: integer
+        minimum: 0
+        maximum: 4294967295
+        description: Timp sfarsit in milisecunde
+        example: 5000
+      input:
+        type: string
+        maxLength: 512
+        description: Calea fisierului video de intrare
+        example: "data/uploads/clip.mp4"
+      output:
+        type: string
+        maxLength: 512
+        description: Calea fisierului video de iesire
+        example: "data/outputs/trimmed.mp4"
+
+  ProtoFilter:
+    description: "Payload OPR_FILTER (1088 bytes): aplica filtru FFmpeg"
+    properties:
+      filter:
+        type: string
+        maxLength: 64
+        description: "Numele filtrului FFmpeg (ex: grayscale, blur, hflip)"
+        example: "grayscale"
+      input:
+        type: string
+        maxLength: 512
+        description: Calea fisierului video de intrare
+        example: "data/uploads/clip.mp4"
+      output:
+        type: string
+        maxLength: 512
+        description: Calea fisierului video de iesire
+        example: "data/outputs/filtered.mp4"
+
+  ProtoMerge:
+    description: "Payload OPR_MERGE (8772 bytes): concateneaza N clipuri (max 16) cu tranzitie; clips[16][512]"
+    properties:
+      count:
+        type: integer
+        minimum: 1
+        maximum: 16
+        description: Numarul de clipuri valide in lista
+        example: 3
+      transition:
+        type: string
+        maxLength: 64
+        description: "Numele tranzitiei (ex: fade, none)"
+        example: "fade"
+      output:
+        type: string
+        maxLength: 512
+        description: Calea fisierului video de iesire
+        example: "data/outputs/merged.mp4"
+      clips:
+        type: string[]
+        maxItems: 16
+        description: Lista cailor clipurilor de concatenat
+        example: ["data/uploads/clip1.mp4", "data/uploads/clip2.mp4"]
+
+  ProtoMixaudio:
+    description: "Payload OPR_MIXAUDIO (1536 bytes): suprapune audio pe video"
+    properties:
+      input_video:
+        type: string
+        maxLength: 512
+        description: Calea fisierului video de intrare
+        example: "data/uploads/clip.mp4"
+      input_audio:
+        type: string
+        maxLength: 512
+        description: Calea fisierului audio de intrare
+        example: "data/uploads/music.mp3"
+      output:
+        type: string
+        maxLength: 512
+        description: Calea fisierului de iesire
+        example: "data/outputs/mixed.mp4"
+
+  ProtoStatus:
+    description: "Payload raspuns status (520 bytes): starea unui task"
+    properties:
+      task_id:
+        type: integer
+        description: ID-ul taskului
+        example: 1
+      state:
+        type: integer
+        description: "Starea taskului: 0=in coada, 1=in executie, 2=terminat cu succes, -1=eroare"
+        enum: [-1, 0, 1, 2]
+        example: 2
+      result_path:
+        type: string
+        maxLength: 512
+        description: Calea rezultatului (populat cand state=2)
+        example: "data/outputs/trimmed.mp4"
+
+  RestOkResponse:
+    properties:
+      status:
+        type: string
+        enum: [ok]
+        example: ok
+      service?:
+        type: string
+        example: vps_rest
+      output?:
+        type: string
+        maxLength: 512
+        example: data/outputs/rest_trimmed.mp4
+
+  RestErrorResponse:
+    properties:
+      status:
+        type: string
+        enum: [error]
+        example: error
+      message:
+        type: string
+        example: processing failed
+
+/health:
+  description: "Endpoint REST shim (HTTP pe 127.0.0.1:18082) pentru health-check"
+  get:
+    responses:
+      200:
+        body:
+          application/json:
+            type: RestOkResponse
+
+/connect:
+  description: "Handshake — obtine un client_id de la server (OPR_CONNECT, op_id=0)"
+  post:
+    description: |
+      Clientul trimite un header cu op_id=0.
+      Serverul raspunde cu acelasi header dar cu client_id populat
+      (generat ca PID XOR socket fd).
+    body:
+      type: ProtoHeader
+    responses:
+      200:
+        body:
+          type: ProtoHeader
+          description: Header cu client_id atribuit
+
+/bye:
+  description: "Inchide sesiunea (OPR_BYE, op_id=1)"
+  post:
+    description: |
+      Clientul trimite un header cu op_id=1.
+      Serverul inchide conexiunea TCP.
+    body:
+      type: ProtoHeader
+    responses:
+      200:
+        description: Conexiunea este inchisa
+
+/trim:
+  description: "Taie un segment dintr-un clip video (OPR_TRIM, op_id=2)"
+  post:
+    description: |
+      Mod TCP binar (18081): header op_id=2 + proto_trim_t.
+      Mod REST shim (18082): POST /trim?input=...&output=...&start_ms=...&end_ms=...
+    queryParameters:
+      input?:
+        type: string
+        maxLength: 512
+      output?:
+        type: string
+        maxLength: 512
+      start_ms?:
+        type: integer
+        minimum: 0
+      end_ms?:
+        type: integer
+        minimum: 0
+    body:
+      properties:
+        header: ProtoHeader
+        payload: ProtoTrim
+    responses:
+      200:
+        body:
+          properties:
+            header: ProtoHeader
+            status: ProtoStatus
+          application/json:
+            type: RestOkResponse
+      400:
+        body:
+          application/json:
+            type: RestErrorResponse
+      500:
+        description: Eroare FFmpeg sau I/O
+
+/filter:
+  description: "Aplica un filtru video FFmpeg (OPR_FILTER, op_id=3)"
+  post:
+    description: |
+      Mod TCP binar (18081): header op_id=3 + proto_filter_t.
+      Mod REST shim (18082): POST /filter?input=...&output=...&filter=...
+    queryParameters:
+      input?:
+        type: string
+        maxLength: 512
+      output?:
+        type: string
+        maxLength: 512
+      filter?:
+        type: string
+        maxLength: 64
+    body:
+      properties:
+        header: ProtoHeader
+        payload: ProtoFilter
+    responses:
+      200:
+        body:
+          properties:
+            header: ProtoHeader
+            status: ProtoStatus
+          application/json:
+            type: RestOkResponse
+      400:
+        body:
+          application/json:
+            type: RestErrorResponse
+      500:
+        description: Eroare FFmpeg sau filtru invalid
+
+/merge:
+  description: "Concateneaza N clipuri video cu tranzitii (OPR_MERGE, op_id=4)"
+  post:
+    description: |
+      Mod TCP binar (18081): header op_id=4 + proto_merge_t.
+      Mod REST shim (18082):
+      POST /merge?output=...&transition=...&clips=a.mp4,b.mp4,c.mp4
+    queryParameters:
+      output?:
+        type: string
+        maxLength: 512
+      transition?:
+        type: string
+        maxLength: 64
+      clips?:
+        type: string
+    body:
+      properties:
+        header: ProtoHeader
+        payload: ProtoMerge
+    responses:
+      200:
+        body:
+          properties:
+            header: ProtoHeader
+            status: ProtoStatus
+          application/json:
+            type: RestOkResponse
+      400:
+        body:
+          application/json:
+            type: RestErrorResponse
+      500:
+        description: Eroare la procesare segmente sau concat
+
+/mixaudio:
+  description: "Suprapune o pista audio pe un clip video (OPR_MIXAUDIO, op_id=5)"
+  post:
+    description: |
+      Mod TCP binar (18081): header op_id=5 + proto_mixaudio_t.
+      Mod REST shim (18082):
+      POST /mixaudio?input_video=...&input_audio=...&output=...
+    queryParameters:
+      input_video?:
+        type: string
+        maxLength: 512
+      input_audio?:
+        type: string
+        maxLength: 512
+      output?:
+        type: string
+        maxLength: 512
+    body:
+      properties:
+        header: ProtoHeader
+        payload: ProtoMixaudio
+    responses:
+      200:
+        body:
+          properties:
+            header: ProtoHeader
+            status: ProtoStatus
+          application/json:
+            type: RestOkResponse
+      400:
+        body:
+          application/json:
+            type: RestErrorResponse
+      500:
+        description: Eroare FFmpeg
+
+/status:
+  description: "Interogheaza starea unui task (OPR_STATUS, op_id=6)"
+  post:
+    description: Header cu op_id=6 si task_id populat.
+    body:
+      type: ProtoHeader
+    responses:
+      200:
+        body:
+          properties:
+            header: ProtoHeader
+            status: ProtoStatus
+      404:
+        description: task_id inexistent
+
+/result:
+  description: "Obtine calea rezultatului unui task finalizat (OPR_RESULT, op_id=7)"
+  post:
+    description: Header cu op_id=7 si task_id populat.
+    body:
+      type: ProtoHeader
+    responses:
+      200:
+        body:
+          properties:
+            header: ProtoHeader
+            status: ProtoStatus
+      404:
+        description: task_id inexistent sau task nefinalizat

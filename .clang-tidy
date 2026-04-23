@@ -1,0 +1,33 @@
+---
+# Mandatory check families per assignment spec.
+# A handful of sub-checks are suppressed with reason:
+#   - DeprecatedOrUnsafeBufferHandling: Annex-K `_s` functions do not exist on
+#     glibc/Linux; impossible to satisfy on the lab target.
+#   - easily-swappable-parameters: flags ordinary helper signatures.
+#   - function-cognitive-complexity: threshold relaxed to 40.
+Checks: >
+  -*,
+  clang-analyzer-core.*,
+  clang-analyzer-unix.*,
+  clang-analyzer-security.insecureAPI.*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cert-*,
+  concurrency-*,
+  -concurrency-mt-unsafe,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*
+WarningsAsErrors: '*'
+HeaderFilterRegex: ''
+CheckOptions:
+  - key: readability-magic-numbers.IgnoredIntegerValues
+    value: '0;1;2;3;4;-1'
+  - key: readability-identifier-length.MinimumVariableNameLength
+    value: '2'
+  - key: readability-identifier-length.MinimumParameterNameLength
+    value: '2'
+  - key: readability-function-cognitive-complexity.Threshold
+    value: '40'
