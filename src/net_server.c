@@ -1,96 +1,401 @@
 /**
- * Echipa 11
- * IR3 2026
- * Proiect PCD - Server TCP cu poll() pentru protocolul video
- * Ce face programul:
- * - deschide un socket TCP si face listen pe portul din configurare
- * - foloseste poll() pt I/O multiplexing (cerinta Nivel A; evit limita FD_SETSIZE de la select())
- * - accepta clienti noi si pastreaza conexiunile deschise pt cereri multiple
- * - dispatch fiecare operatie video (trim/filter/merge/mixaudio) catre un worker fork()-at
- * - asteapta raspunsul workerului si trimite statusul inapoi la client
- * - face reap pe procesele copil terminate (waitpid cu WNOHANG) pt a evita zombii
- * Erori tratate explicit:
- * - socket/setsockopt/bind/listen/accept esuate
- * - poll() intrerupt de semnal (EINTR -> reincerc)
- * - alocare memorie esuata pt vectorul de pollfd
- * - client deconectat sau cerere invalida
- * - SIGPIPE ignorat (clientul poate inchide brut conexiunea)
- * - SIGINT/SIGTERM -> shutdown curat
+ * Echipa 11 · IR3 2026 · PCD
+ * Server TCP cu poll() (Nivel A: I/O multiplexing).
+ * Refactorizat in milestone 2 pt:
+ *  - coada de joburi async: fork()+execv() pt ffmpeg, raspunde imediat cu task_id
+ *  - operatii admin (UX): PING, LIST_JOBS, STATS, SHUTDOWN
+ *  - transfer fisiere (REMOTE/IN): UPLOAD / DOWNLOAD streaming pe socket
+ *  - STATUS / RESULT functional pe baza tabelei de joburi
  */
 
-// activeaza API-uri POSIX in headerele de sistem
 #ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L // nivel POSIX tinta pentru proiect
+#define _POSIX_C_SOURCE 200809L
 #endif
 
-#define LISTEN_BACKLOG 16 // cati clienti pot sta in coada de accept
-#define POLL_TIMEOUT_MS 1000 // timeout poll() in ms (verific periodic semnale + zombii)
+#define LISTEN_BACKLOG 16
+#define POLL_TIMEOUT_MS 1000
+// permisiuni standard pt directoarele/fisierele scrise de server
+#define DIR_MODE_DEFAULT  0755
+#define FILE_MODE_DEFAULT 0644
 
-// stari pe care le punem in proto_status_t.state (int32 semnat)
-#define TASK_STATE_DONE 2 // task terminat cu succes
-#define TASK_STATE_ERR (-1) // task esuat
-
-#include "net_server.h" // server_cfg_t + declaratia net_server_run()
-#include "proto.h" // protocolul binar (header, payload-uri, framing)
-#include "worker.h" // worker_spawn/wait/dispatch_merge -- fork()+execv()
+#include "net_server.h" // server_cfg_t + net_server_run()
+#include "proto.h" // header binar, payload-uri, helpers I/O
+#include "worker.h" // worker_spawn / worker_dispatch_merge
 #include "video_ops.h" // video_ctx_t + argv builders pt ffmpeg
+#include "jobs.h" // tabela de joburi async + cleanup
 
-#include <errno.h> // errno, EINTR pt retry dupa semnale
-#include <netinet/in.h> // sockaddr_in, htons, htonl pt adrese IPv4
-#include <signal.h> // sigaction, sig_atomic_t pt handler semnale
+#include <errno.h> // EINTR pt poll retry
+#include <fcntl.h> // open flags pt upload/download
+#include <libgen.h> // basename pt sanitize_basename (anti path traversal)
+#include <netinet/in.h> // sockaddr_in, htons, htonl pt IPv4 listen
+#include <signal.h> // sigaction, sig_atomic_t pt SIGINT/SIGTERM/SIGPIPE
 #include <stdint.h> // uint16_t, uint32_t pt campuri protocol
-#include <stdio.h> // fprintf, snprintf pt output/erori
-#include <stdlib.h> // calloc, free pt vectorul de pollfd
-#include <string.h> // memset pt initializare structuri
+#include <stdio.h> // fprintf, snprintf pt log si paths
+#include <stdlib.h> // calloc/free pt vectorul de pollfd
+#include <string.h> // memset, strncmp, strstr pt path checks
 #include <sys/poll.h> // poll(), struct pollfd, POLLIN/POLLERR
 #include <sys/socket.h> // socket, bind, listen, accept, setsockopt
+#include <sys/stat.h> // mkdir, fstat, S_ISREG pt directoare si download
 #include <sys/types.h> // pid_t
-#include <sys/wait.h> // waitpid, WNOHANG pt reap zombii
-#include <unistd.h> // close, getpid
+#include <time.h> // time(NULL) pt sweep cleanup periodic
+#include <unistd.h> // close, getpid, read, write
 
-static volatile sig_atomic_t g_stop = 0; // flag global pt shutdown curat
+static volatile sig_atomic_t g_stop = 0;
 
-// handler pt SIGINT/SIGTERM, setez flagul si ies din poll()
 static void on_signal(int sig)
 {
     (void)sig;
     g_stop = 1;
 }
 
-// curata procesele copil terminate ca sa nu raman zombii
-// waitpid cu WNOHANG = nu blocheaza daca nu e nimeni terminat
-static void reap_children(void)
+// ---------- I/O helpers pt raspunsuri ----------
+
+// trimite un raspuns: header + payload de dimensiune fixa
+static int reply_with(int sock, const proto_header_t *req, uint32_t op_id,
+                      const void *payload, size_t plen)
 {
-    pid_t pid;
-    int status;
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        // am recuperat statusul dar nu il folosesc pt nimic
-        (void)pid;
-        (void)status;
+    proto_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msg_size = (uint32_t)(sizeof(hdr) + plen);
+    hdr.client_id = req->client_id;
+    hdr.op_id = op_id;
+    hdr.task_id = req->task_id;
+    if (proto_write_header(sock, &hdr) < 0) {
+        return -1;
     }
+    if (plen > 0 && proto_write_full(sock, payload, plen) < 0) {
+        return -1;
+    }
+    return 0;
 }
 
-// deschide socketul de listen pe portul dat
+static int reply_status(int sock, const proto_header_t *req, uint32_t task_id,
+                        int32_t state, const char *path)
+{
+    proto_status_t sts;
+    memset(&sts, 0, sizeof(sts));
+    sts.task_id = htonl(task_id);
+    sts.state = (int32_t)htonl((uint32_t)state);
+    (void)snprintf(sts.result_path, sizeof(sts.result_path), "%s",
+                   path != NULL ? path : "");
+    return reply_with(sock, req, OPR_STATUS, &sts, sizeof(sts));
+}
+
+// ---------- Submit async pt video ops (TRIM/FILTER/MIXAUDIO) ----------
+
+// fork+execv direct pe ffmpeg, inregistreaza in tabela, returneaza task_id
+static uint32_t submit_simple(jobs_table_t *jobs, const video_ctx_t *vctx,
+                              uint32_t op_id, char **argv, const char *output)
+{
+    pid_t pid = worker_spawn(vctx, argv);
+    if (pid <= 0) {
+        video_argv_free(argv);
+        return 0U;
+    }
+    uint32_t tid = jobs_submit(jobs, op_id, output, argv, pid);
+    if (tid == 0U) {
+        // tabela plina; nu putem urmari jobul, ucidem copilul
+        (void)kill(pid, SIGTERM);
+        video_argv_free(argv);
+        return 0U;
+    }
+    return tid;
+}
+
+// MERGE async: fork un orchestrator (sincron intern); parintele tine doar pid-ul lui
+static uint32_t submit_merge(jobs_table_t *jobs, const video_ctx_t *vctx,
+                             const proto_merge_t *op)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 0U;
+    }
+    if (pid == 0) {
+        int rc = worker_dispatch_merge(vctx, op);
+        _exit(rc == 0 ? 0 : 1);
+    }
+    // parinte: argv NULL pt merge (orchestratorul isi gestioneaza singur)
+    return jobs_submit(jobs, OPR_MERGE, op->output, NULL, pid);
+}
+
+// ---------- Handlere video (TRIM/FILTER/MERGE/MIXAUDIO) ----------
+
+static int handle_trim(int sock, const video_ctx_t *vctx, jobs_table_t *jobs,
+                       const proto_header_t *hdr)
+{
+    proto_trim_t req;
+    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
+        return -1;
+    }
+    char **argv = video_build_trim_argv(vctx, &req);
+    if (argv == NULL) {
+        return reply_status(sock, hdr, 0U, TASK_STATE_ERR, "");
+    }
+    uint32_t tid = submit_simple(jobs, vctx, OPR_TRIM, argv, req.output);
+    if (tid == 0U) {
+        return reply_status(sock, hdr, 0U, TASK_STATE_ERR, "");
+    }
+    return reply_status(sock, hdr, tid, TASK_STATE_RUNNING, req.output);
+}
+
+static int handle_filter(int sock, const video_ctx_t *vctx, jobs_table_t *jobs,
+                         const proto_header_t *hdr)
+{
+    proto_filter_t req;
+    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
+        return -1;
+    }
+    char **argv = video_build_filter_argv(vctx, &req);
+    if (argv == NULL) {
+        return reply_status(sock, hdr, 0U, TASK_STATE_ERR, "");
+    }
+    uint32_t tid = submit_simple(jobs, vctx, OPR_FILTER, argv, req.output);
+    if (tid == 0U) {
+        return reply_status(sock, hdr, 0U, TASK_STATE_ERR, "");
+    }
+    return reply_status(sock, hdr, tid, TASK_STATE_RUNNING, req.output);
+}
+
+static int handle_merge(int sock, const video_ctx_t *vctx, jobs_table_t *jobs,
+                        const proto_header_t *hdr)
+{
+    proto_merge_t req;
+    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
+        return -1;
+    }
+    uint32_t tid = submit_merge(jobs, vctx, &req);
+    if (tid == 0U) {
+        return reply_status(sock, hdr, 0U, TASK_STATE_ERR, "");
+    }
+    return reply_status(sock, hdr, tid, TASK_STATE_RUNNING, req.output);
+}
+
+static int handle_mixaudio(int sock, const video_ctx_t *vctx, jobs_table_t *jobs,
+                           const proto_header_t *hdr)
+{
+    proto_mixaudio_t req;
+    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
+        return -1;
+    }
+    char **argv = video_build_mixaudio_argv(vctx, &req);
+    if (argv == NULL) {
+        return reply_status(sock, hdr, 0U, TASK_STATE_ERR, "");
+    }
+    uint32_t tid = submit_simple(jobs, vctx, OPR_MIXAUDIO, argv, req.output);
+    if (tid == 0U) {
+        return reply_status(sock, hdr, 0U, TASK_STATE_ERR, "");
+    }
+    return reply_status(sock, hdr, tid, TASK_STATE_RUNNING, req.output);
+}
+
+// ---------- STATUS / RESULT ----------
+
+static int handle_status(int sock, jobs_table_t *jobs, const proto_header_t *hdr)
+{
+    proto_query_t query;
+    if (proto_read_full(sock, &query, sizeof(query)) < 0) {
+        return -1;
+    }
+    uint32_t task_id = ntohl(query.task_id);
+    job_entry_t *slot = jobs_find(jobs, task_id);
+    if (slot == NULL) {
+        return reply_status(sock, hdr, task_id, TASK_STATE_ERR, "");
+    }
+    return reply_status(sock, hdr, slot->task_id, slot->state, slot->output);
+}
+
+// ---------- Admin ops (UX): PING / LIST_JOBS / STATS / SHUTDOWN ----------
+
+static int handle_ping(int sock, const proto_header_t *hdr)
+{
+    return reply_with(sock, hdr, OPR_PING, NULL, 0);
+}
+
+static int handle_list_jobs(int sock, jobs_table_t *jobs, const proto_header_t *hdr)
+{
+    proto_list_jobs_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+    uint32_t cnt = 0;
+    for (size_t ix = 0; ix < JOBS_MAX && cnt < PROTO_LIST_MAX_JOBS; ix++) {
+        if (jobs->slots[ix].used == 0) {
+            continue;
+        }
+        rep.jobs[cnt].task_id = htonl(jobs->slots[ix].task_id);
+        rep.jobs[cnt].op_id = htonl(jobs->slots[ix].op_id);
+        rep.jobs[cnt].state = (int32_t)htonl((uint32_t)jobs->slots[ix].state);
+        (void)snprintf(rep.jobs[cnt].output, sizeof(rep.jobs[cnt].output),
+                       "%s", jobs->slots[ix].output);
+        cnt++;
+    }
+    rep.count = htonl(cnt);
+    return reply_with(sock, hdr, OPR_LIST_JOBS, &rep, sizeof(rep));
+}
+
+static int handle_stats(int sock, jobs_table_t *jobs, const proto_header_t *hdr)
+{
+    proto_stats_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+    uint32_t queued = 0;
+    uint32_t running = 0;
+    for (size_t ix = 0; ix < JOBS_MAX; ix++) {
+        if (jobs->slots[ix].used == 0) {
+            continue;
+        }
+        if (jobs->slots[ix].state == TASK_STATE_QUEUED) {
+            queued++;
+        }
+        if (jobs->slots[ix].state == TASK_STATE_RUNNING) {
+            running++;
+        }
+    }
+    rep.jobs_queued = htonl(queued);
+    rep.jobs_running = htonl(running);
+    rep.jobs_done = htonl(jobs->counter_done);
+    rep.jobs_failed = htonl(jobs->counter_failed);
+    rep.uptime_sec = htonl((uint32_t)(time(NULL) - jobs->started_at));
+    return reply_with(sock, hdr, OPR_STATS, &rep, sizeof(rep));
+}
+
+static int handle_shutdown(int sock, const proto_header_t *hdr)
+{
+    // raspund ACK inainte de a seta flagul de shutdown
+    int rc = reply_with(sock, hdr, OPR_SHUTDOWN, NULL, 0);
+    g_stop = 1;
+    return rc;
+}
+
+// ---------- File transfer (REMOTE/IN): UPLOAD / DOWNLOAD ----------
+
+// extrage doar basename-ul fara directoare, ca sa nu permit path traversal
+static void sanitize_basename(char *out, size_t out_sz, const char *raw)
+{
+    char tmp[PROTO_MAX_PATH];
+    (void)snprintf(tmp, sizeof(tmp), "%s", raw != NULL ? raw : "file");
+    char *base = basename(tmp);
+    // refuz secventele suspecte
+    if (base == NULL || base[0] == '\0' || base[0] == '.') {
+        (void)snprintf(out, out_sz, "upload.bin");
+        return;
+    }
+    (void)snprintf(out, out_sz, "%s", base);
+}
+
+static int handle_upload(int sock, const video_ctx_t *vctx, const proto_header_t *hdr)
+{
+    proto_upload_t req;
+    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
+        return -1;
+    }
+    uint64_t size = req.size_bytes; // payload host-order; clientul scrie host-order
+    char safe[PROTO_MAX_PATH];
+    sanitize_basename(safe, sizeof(safe), req.filename);
+
+    // subdir dedicat + prefix pid/counter ca sa evit coliziune cu fixtures si intre clienti
+    char incoming[PROTO_MAX_PATH];
+    (void)snprintf(incoming, sizeof(incoming), "%.400s/incoming", vctx->uploads_dir);
+    (void)mkdir(vctx->uploads_dir, DIR_MODE_DEFAULT);
+    (void)mkdir(incoming, DIR_MODE_DEFAULT);
+
+    static uint32_t upload_counter = 0;
+    upload_counter++;
+    char stored[PROTO_MAX_PATH];
+    (void)snprintf(stored, sizeof(stored), "%.380s/%u_%u_%.80s",
+                   incoming, (uint32_t)getpid(), upload_counter, safe);
+
+    int fd = open(stored, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE_DEFAULT);
+    if (fd < 0) {
+        // tot trebuie sa drenez datele de pe socket ca sa nu desincronizam protocolul
+        // dar daca size e mare, mai bine inchidem conexiunea
+        proto_upload_reply_t rep;
+        memset(&rep, 0, sizeof(rep));
+        rep.state = (int32_t)htonl((uint32_t)TASK_STATE_ERR);
+        (void)reply_with(sock, hdr, OPR_UPLOAD, &rep, sizeof(rep));
+        return -1;
+    }
+    int rc = proto_recv_file(sock, fd, size);
+    (void)close(fd);
+
+    proto_upload_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+    if (rc < 0) {
+        rep.state = (int32_t)htonl((uint32_t)TASK_STATE_ERR);
+        rep.bytes_received = 0;
+        (void)reply_with(sock, hdr, OPR_UPLOAD, &rep, sizeof(rep));
+        return -1;
+    }
+    rep.state = (int32_t)htonl((uint32_t)TASK_STATE_DONE);
+    rep.bytes_received = size;
+    (void)snprintf(rep.stored_path, sizeof(rep.stored_path), "%s", stored);
+    return reply_with(sock, hdr, OPR_UPLOAD, &rep, sizeof(rep));
+}
+
+// permite descarcari doar din uploads_dir / outputs_dir (anti path-traversal simplu)
+static int path_is_allowed(const video_ctx_t *vctx, const char *path)
+{
+    if (path == NULL || path[0] == '\0' || strstr(path, "..") != NULL) {
+        return 0;
+    }
+    // permit doar download din outputs_dir (rezultate de ffmpeg)
+    if (strncmp(path, vctx->outputs_dir, strlen(vctx->outputs_dir)) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int handle_download(int sock, const video_ctx_t *vctx, const proto_header_t *hdr)
+{
+    proto_download_t req;
+    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
+        return -1;
+    }
+    proto_download_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+
+    if (path_is_allowed(vctx, req.path) == 0) {
+        rep.state = (int32_t)htonl((uint32_t)TASK_STATE_ERR);
+        return reply_with(sock, hdr, OPR_DOWNLOAD, &rep, sizeof(rep));
+    }
+
+    int fd = open(req.path, O_RDONLY);
+    if (fd < 0) {
+        rep.state = (int32_t)htonl((uint32_t)TASK_STATE_ERR);
+        return reply_with(sock, hdr, OPR_DOWNLOAD, &rep, sizeof(rep));
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        (void)close(fd);
+        rep.state = (int32_t)htonl((uint32_t)TASK_STATE_ERR);
+        return reply_with(sock, hdr, OPR_DOWNLOAD, &rep, sizeof(rep));
+    }
+    rep.state = (int32_t)htonl((uint32_t)TASK_STATE_DONE);
+    rep.size_bytes = (uint64_t)st.st_size;
+    if (reply_with(sock, hdr, OPR_DOWNLOAD, &rep, sizeof(rep)) < 0) {
+        (void)close(fd);
+        return -1;
+    }
+    int rc = proto_send_file(sock, fd, (uint64_t)st.st_size);
+    (void)close(fd);
+    return rc;
+}
+
+// ---------- Listener & dispatch ----------
+
 static int open_listener(int port)
 {
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd < 0) {
-        return -1; // socket() esuat
+        return -1;
     }
-
-    // SO_REUSEADDR ca sa pot reporni serverul rapid fara "address already in use"
     int yes = 1;
     if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
         (void)close(sfd);
         return -1;
     }
-
     struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr)); // initializez complet (core.uninitialized)
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port); // network byte order
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // ascult pe toate interfetele
-
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         (void)close(sfd);
         return -1;
@@ -102,93 +407,12 @@ static int open_listener(int port)
     return sfd;
 }
 
-// trimite un raspuns de status catre client (rcode=0 -> done, altfel -> eroare)
-static int write_status_reply(int sock, const proto_header_t *hdr, int rcode, const char *result_path)
-{
-    proto_header_t reply = *hdr;
-    reply.msg_size = (uint32_t)(sizeof(reply) + sizeof(proto_status_t));
-
-    proto_status_t sts;
-    memset(&sts, 0, sizeof(sts));
-    sts.task_id = htonl(hdr->task_id);
-    sts.state = (int32_t)htonl((uint32_t)(rcode == 0 ? TASK_STATE_DONE : TASK_STATE_ERR));
-    (void)snprintf(sts.result_path, sizeof(sts.result_path), "%s", result_path != NULL ? result_path : "");
-
-    if (proto_write_header(sock, &reply) < 0) {
-        return -1;
-    }
-    return proto_write_full(sock, &sts, sizeof(sts));
-}
-
-// handler TRIM: citesc payload-ul, construiesc argv-ul pt ffmpeg, fork + execv
-static int handle_trim(int sock, const video_ctx_t *vctx, const proto_header_t *hdr)
-{
-    proto_trim_t req;
-    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
-        return -1;
-    }
-    char **argv = video_build_trim_argv(vctx, &req);
-    if (argv == NULL) {
-        return -1;
-    }
-    pid_t pid = worker_spawn(vctx, argv);
-    int rcode = (pid > 0) ? worker_wait(pid) : -1;
-    video_argv_free(argv);
-    return write_status_reply(sock, hdr, rcode, req.output);
-}
-
-// handler FILTER: aplica un filtru video via ffmpeg
-static int handle_filter(int sock, const video_ctx_t *vctx, const proto_header_t *hdr)
-{
-    proto_filter_t req;
-    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
-        return -1;
-    }
-    char **argv = video_build_filter_argv(vctx, &req);
-    if (argv == NULL) {
-        return -1;
-    }
-    pid_t pid = worker_spawn(vctx, argv);
-    int rcode = (pid > 0) ? worker_wait(pid) : -1;
-    video_argv_free(argv);
-    return write_status_reply(sock, hdr, rcode, req.output);
-}
-
-// handler MERGE: concatenare clipuri cu paralelism (vezi worker_dispatch_merge)
-static int handle_merge(int sock, const video_ctx_t *vctx, const proto_header_t *hdr)
-{
-    proto_merge_t req;
-    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
-        return -1;
-    }
-    int rcode = worker_dispatch_merge(vctx, &req);
-    return write_status_reply(sock, hdr, rcode, req.output);
-}
-
-// handler MIXAUDIO: suprapune audio pe video
-static int handle_mixaudio(int sock, const video_ctx_t *vctx, const proto_header_t *hdr)
-{
-    proto_mixaudio_t req;
-    if (proto_read_full(sock, &req, sizeof(req)) < 0) {
-        return -1;
-    }
-    char **argv = video_build_mixaudio_argv(vctx, &req);
-    if (argv == NULL) {
-        return -1;
-    }
-    pid_t pid = worker_spawn(vctx, argv);
-    int rcode = (pid > 0) ? worker_wait(pid) : -1;
-    video_argv_free(argv);
-    return write_status_reply(sock, hdr, rcode, req.output);
-}
-
-static int dispatch_one(int sock, const video_ctx_t *vctx)
+static int dispatch_one(int sock, const video_ctx_t *vctx, jobs_table_t *jobs)
 {
     proto_header_t hdr;
     if (proto_read_header(sock, &hdr) < 0) {
         return -1;
     }
-
     switch (hdr.op_id) {
         case OPR_CONNECT: {
             proto_header_t reply = hdr;
@@ -196,17 +420,24 @@ static int dispatch_one(int sock, const video_ctx_t *vctx)
             reply.msg_size = (uint32_t)sizeof(reply);
             return proto_write_header(sock, &reply);
         }
-        case OPR_TRIM:     return handle_trim(sock, vctx, &hdr);
-        case OPR_FILTER:   return handle_filter(sock, vctx, &hdr);
-        case OPR_MERGE:    return handle_merge(sock, vctx, &hdr);
-        case OPR_MIXAUDIO: return handle_mixaudio(sock, vctx, &hdr);
+        case OPR_TRIM:        return handle_trim(sock, vctx, jobs, &hdr);
+        case OPR_FILTER:      return handle_filter(sock, vctx, jobs, &hdr);
+        case OPR_MERGE:       return handle_merge(sock, vctx, jobs, &hdr);
+        case OPR_MIXAUDIO:    return handle_mixaudio(sock, vctx, jobs, &hdr);
+        case OPR_STATUS:      // STATUS si RESULT au acelasi raspuns
+        case OPR_RESULT:      return handle_status(sock, jobs, &hdr);
+        case OPR_PING:        return handle_ping(sock, &hdr);
+        case OPR_LIST_JOBS:   return handle_list_jobs(sock, jobs, &hdr);
+        case OPR_STATS:       return handle_stats(sock, jobs, &hdr);
+        case OPR_SHUTDOWN:    return handle_shutdown(sock, &hdr);
+        case OPR_UPLOAD:      return handle_upload(sock, vctx, &hdr);
+        case OPR_DOWNLOAD:    return handle_download(sock, vctx, &hdr);
         case OPR_BYE:
         default:
             return -1;
     }
 }
 
-// instalez handlerii pt semnale: SIGINT/SIGTERM -> shutdown, SIGPIPE -> ignorat
 static void install_signal_handlers(void)
 {
     struct sigaction sact;
@@ -221,22 +452,19 @@ static void install_signal_handlers(void)
     (void)sigaction(SIGPIPE, &ign, NULL);
 }
 
-// accepta un client nou si il adauga in vectorul de pollfd
-static void accept_new_client(int listen_fd, struct pollfd *fds, nfds_t *nfds, nfds_t limit)
+static void accept_new_client(int listen_fd, struct pollfd *fds,
+                              nfds_t *nfds, nfds_t limit)
 {
-    struct sockaddr_in peer;
-    memset(&peer, 0, sizeof(peer));
-    socklen_t len = sizeof(peer);
-    int client_fd = accept(listen_fd, (struct sockaddr *)&peer, &len);
+    int client_fd = accept(listen_fd, NULL, NULL);
     if (client_fd < 0) {
         return;
     }
     if (*nfds < limit) {
-        fds[*nfds].fd = client_fd; // adaug fd clientului
-        fds[*nfds].events = POLLIN; // vreau sa fiu notificat cand are date
+        fds[*nfds].fd = client_fd;
+        fds[*nfds].events = POLLIN;
         (*nfds)++;
     } else {
-        (void)close(client_fd); // prea multi clienti, refuz conexiunea
+        (void)close(client_fd);
     }
 }
 
@@ -244,58 +472,82 @@ int net_server_run(const server_cfg_t *cfg)
 {
     install_signal_handlers();
 
+    // creez directoarele de upload/output ca sa pot scrie fisierele primite
+    (void)mkdir(cfg->video.uploads_dir, DIR_MODE_DEFAULT);
+    (void)mkdir(cfg->video.outputs_dir, DIR_MODE_DEFAULT);
+
+    jobs_table_t jobs;
+    jobs_init(&jobs);
+
     int listen_fd = open_listener(cfg->listen_port);
     if (listen_fd < 0) {
         (void)fprintf(stderr, "net_server: listener open failed\n");
         return -1;
     }
 
-    // aloc vectorul de pollfd: slot 0 = listen, restul = clienti
     nfds_t limit = (nfds_t)cfg->max_clients + 1U;
     struct pollfd *fds = (struct pollfd *)calloc((size_t)limit, sizeof(struct pollfd));
     if (fds == NULL) {
         (void)close(listen_fd);
         return -1;
     }
-
-    fds[0].fd = listen_fd; // primul slot e mereu socketul de listen
+    fds[0].fd = listen_fd;
     fds[0].events = POLLIN;
     nfds_t nfds = 1;
 
-    (void)fprintf(stderr, "vps_server: listening on port %d (max_clients=%d)\n", cfg->listen_port, cfg->max_clients);
+    // Cleanup config (0 din libconfig -> default). outputs/ NU este atins.
+    unsigned ret_sec = (cfg->jobs_retention_sec > 0)
+                       ? (unsigned)cfg->jobs_retention_sec
+                       : JOBS_RETENTION_SEC_DEFAULT;
+    char incoming_dir[PROTO_MAX_PATH];
+    (void)snprintf(incoming_dir, sizeof(incoming_dir), "%.400s/incoming",
+                   cfg->video.uploads_dir);
+    time_t last_cleanup = time(NULL);
 
-    // bucla principala: poll() asteapta evenimente pe toti fd
+    (void)fprintf(stderr,
+        "vps_server: listening on port %d (max_clients=%d, jobs_retention=%us)\n",
+        cfg->listen_port, cfg->max_clients, ret_sec);
+
     while (g_stop == 0) {
         int ready = poll(fds, nfds, POLL_TIMEOUT_MS);
-        reap_children(); // la fiecare iteratie curatam zombii
+        jobs_reap_running(&jobs);
+
+        // sweep cleanup: elibereaza sloturi vechi + sterge duplicate din incoming/ (outputs/ neatins)
+        time_t now = time(NULL);
+        if ((now - last_cleanup) >= CLEANUP_INTERVAL_SEC) {
+            unsigned freed = jobs_evict_old(&jobs, ret_sec);
+            unsigned dups = cleanup_incoming_duplicates(incoming_dir,
+                                                       cfg->video.uploads_dir);
+            if (freed != 0U || dups != 0U) {
+                (void)fprintf(stderr,
+                    "vps_server: cleanup slots_freed=%u dup_removed=%u\n",
+                    freed, dups);
+            }
+            last_cleanup = now;
+        }
 
         if (ready < 0) {
             if (errno == EINTR) {
-                continue; // intrerupt de semnal, reincerc
+                continue;
             }
-            break; // eroare fatala
+            break;
         }
         if (ready == 0) {
-            continue; // timeout, reincerc (verific g_stop)
+            continue;
         }
-
-        // daca socketul de listen are date, acceptam un client nou
         if ((fds[0].revents & POLLIN) != 0) {
             accept_new_client(listen_fd, fds, &nfds, limit);
         }
-
-        // parcurg toti clientii conectati
         for (nfds_t ix = 1; ix < nfds; ix++) {
             if ((fds[ix].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
-                continue; // fara eveniment pe acest fd
+                continue;
             }
             int sock = fds[ix].fd;
-            if (dispatch_one(sock, &cfg->video) < 0) {
-                // dispatch esuat sau client deconectat -> inchid si scot din vector
+            if (dispatch_one(sock, &cfg->video, &jobs) < 0) {
                 (void)close(sock);
-                fds[ix] = fds[nfds - 1]; // swap cu ultimul
+                fds[ix] = fds[nfds - 1];
                 nfds--;
-                ix--; // reverific pozitia curenta
+                ix--;
             }
         }
     }
@@ -304,28 +556,6 @@ int net_server_run(const server_cfg_t *cfg)
         (void)close(fds[ix].fd);
     }
     free(fds);
+    jobs_destroy(&jobs);
     return 0;
 }
-
-/*
- *> Compilare si exemple de rulare:
- *
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ make all
- * (net_server.c este compilat ca parte din vps_server)
- * gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werror -g -Iinclude -c src/net_server.c -o build/net_server.o
- *
- * --- Rulare cu succes ---
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ nohup bin/vps_server -v >/tmp/final_vps_server.log 2>&1 &
- * [1] 19224
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ head -3 /tmp/final_vps_server.log
- * nohup: ignoring input
- * vps_server: port=18081 max_clients=64 merge_par=4 ffmpeg=/usr/bin/ffmpeg
- * vps_server: running as user=vladb
- *
- * --- Rulare cu esec ---
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ nohup bin/vps_server >/tmp/net_a.log 2>&1 &
- * [1] 19583
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ bin/vps_server >/tmp/net_b.log 2>&1
- * vladb:~/PCD/pcd-lucru/Proiect/skeleton$ cat /tmp/net_b.log
- * net_server: listener open failed
- */

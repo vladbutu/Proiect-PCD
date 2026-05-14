@@ -14,6 +14,8 @@ typedef struct server_cfg {
     int listen_port;   // portul TCP pe care asculta
     int max_clients;   // nr maxim de clienti concurenti in poll()
     video_ctx_t video; // contextul video (ffmpeg binary, dirs, paralelism)
+    // Retentie sloturi joburi DONE/ERR in secunde (0 = default din jobs.h)
+    int jobs_retention_sec;
 } server_cfg_t;
 
 // intra in bucla poll(); blocheaza pana la SIGTERM sau eroare fatala

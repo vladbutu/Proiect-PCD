@@ -39,8 +39,7 @@
 // (de la FFmpeg 4.x av_register_all() e no-op, dar tin hookul pt compatibilitate)
 int video_init(void)
 {
-    /* Since FFmpeg 4.x av_register_all() is a no-op; we only keep the
-     * hook here in case an older libav is installed on the lab machine. */
+    // FFmpeg 4.x+: av_register_all() e no-op; pastram hook pt eventual libav vechi
     avformat_network_init();
     return 0;
 }
@@ -308,9 +307,7 @@ int video_write_concat_list(const proto_merge_t *op, const video_ctx_t *ctx, cha
     return 0;
 }
 
-// construieste argv[] pt MERGE cu tranzitii xfade intre clipuri
-// probeaza durata fiecarui clip, apoi genereaza -filter_complex cu xfade+acrossfade
-// necesita re-encoding (libx264+aac), deci dureaza mai mult decat concat simplu
+// argv[] pt MERGE cu xfade: probeaza duratele, genereaza -filter_complex; necesita re-encoding
 char **video_build_xfade_argv(const video_ctx_t *ctx, const proto_merge_t *op)
 {
     if (ctx == NULL || op == NULL || op->count < 2) {

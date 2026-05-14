@@ -139,6 +139,11 @@ static int load_config(const cli_opts_t *cli, server_cfg_t *scfg)
     (void)config_lookup_int(&cfg, "server.max_workers", &max_workers);
     (void)config_lookup_int(&cfg, "server.merge_parallelism", &merge_par);
 
+    // Retentie sloturi joburi DONE/ERR (0 = default din jobs.h)
+    int ret_sec = 0;
+    (void)config_lookup_int(&cfg, "cleanup.jobs_retention_sec", &ret_sec);
+    scfg->jobs_retention_sec = ret_sec;
+
     (void)max_workers; 
 
     scfg->listen_port = (cli->override_port > 0) ? cli->override_port : port;
@@ -180,9 +185,7 @@ int main(int argc, char **argv)
             "vps_server: port=%d max_clients=%d merge_par=%d ffmpeg=%s\n",
             scfg.listen_port, scfg.max_clients,
             scfg.video.merge_parallelism, scfg.video.ffmpeg_binary);
-        // afisez informatii mediu; getenv("USER") e safe aici pt ca suntem
-        // inca in faza single-threaded, inainte de fork()
-        // (secure_getenv ar fi preferabil dar nu e portabil)
+        // getenv safe aici: single-threaded, inainte de fork (secure_getenv neportabil)
         const char *user = getenv("USER"); /* NOLINT */
         if (user != NULL) {
             (void)fprintf(stderr, "vps_server: running as user=%s\n", user);

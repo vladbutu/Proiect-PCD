@@ -34,16 +34,13 @@ typedef struct video_ctx {
     int  merge_parallelism;             // cate segmente in paralel la merge
 } video_ctx_t;
 
-// initializare unica: porneste subsistemul de retea libav
-// returneaza 0 la succes, -1 la eroare
+// init unic: porneste subsistemul de retea libav (0 succes, -1 eroare)
 int video_init(void);
 
 // inspectez un clip cu libavformat; populez 'out' la succes
 int video_probe(const char *path, video_info_t *out);
 
-// aceste functii NU fac fork; construiesc argv-ul pt ffmpeg
-// returneaza un vector NULL-terminated de stringuri pe heap
-// caller-ul trebuie sa elibereze vectorul SI fiecare string (video_argv_free)
+// constructori argv pt ffmpeg (NU fac fork); vector NULL-terminat pe heap, caller elibereaza cu video_argv_free
 char **video_build_trim_argv(const video_ctx_t *ctx,
                              const proto_trim_t *op);
 char **video_build_filter_argv(const video_ctx_t *ctx,

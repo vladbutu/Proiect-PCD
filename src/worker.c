@@ -33,8 +33,7 @@
 
 #define WORKER_CHILD_EXIT_FAIL 127 // cod de exit cand execv esueaza in copil
 
-// ruleaza o comanda ffmpeg intr-un proces copil creat cu fork()
-// returneaza PID-ul copilului (>0) la succes sau -1 la eroare
+// fork+execv ffmpeg; PID copil (>0) la succes, -1 la eroare; argv ramane al caller-ului
 pid_t worker_spawn(const video_ctx_t *ctx, char **argv)
 {
     if (ctx == NULL || argv == NULL || argv[0] == NULL) {
@@ -43,30 +42,22 @@ pid_t worker_spawn(const video_ctx_t *ctx, char **argv)
 
     pid_t pid = fork();
     if (pid < 0) {
-        video_argv_free(argv); // fork esuat, eliberez argv
-        return -1;
+        return -1; // argv ramane al caller-ului (eliberare aici = double-free)
     }
     if (pid == 0) {
-        // Evit blocarea in background din cauza stdin-ului legat la terminal.
-        // ffmpeg poate incerca sa citeasca stdin pentru comenzi interactive.
+        // redirectez stdin la /dev/null ca sa nu se blocheze ffmpeg pe input interactiv
         int nullfd = open("/dev/null", O_RDONLY);
         if (nullfd >= 0) {
             (void)dup2(nullfd, STDIN_FILENO);
             (void)close(nullfd);
         }
-
-        // copil: inlocuiesc imaginea procesului cu ffmpeg
         (void)execv(argv[0], argv);
-        // daca am ajuns aici, execv a esuat; ies cu _exit (nu exit,
-        // ca sa nu rulez atexit handlers mosteniti de la parinte)
-        _exit(WORKER_CHILD_EXIT_FAIL);
+        _exit(WORKER_CHILD_EXIT_FAIL); // _exit ca sa nu ruleze atexit mostenit
     }
-    // parinte: argv-ul ramane al caller-ului, nu eliberam aici
     return pid;
 }
 
-// asteapta blocant un copil specific; returnez 0 daca a iesit cu succes, -1 altfel
-// folosesc waitpid (nu wait simplu) ca sa astept fix copilul pe care l-am creat
+// asteapta blocant PID-ul; 0 daca copilul a iesit cu success, -1 altfel
 int worker_wait(pid_t pid)
 {
     int status = 0;
@@ -109,6 +100,7 @@ static int build_segment(const video_ctx_t *ctx, const proto_merge_t *op, uint32
     }
     pid_t pid = worker_spawn(ctx, argv);
     if (pid < 0) {
+        video_argv_free(argv);
         return -1;
     }
     int ret = worker_wait(pid);
@@ -154,8 +146,7 @@ int worker_dispatch_merge(const video_ctx_t *ctx, const proto_merge_t *op)
         uint32_t to = cursor + take;
         cursor = to;
 
-        // fiecare segment e procesat intr-un copil separat care la randul lui
-        // face fork+execv pe ffmpeg prin build_segment()
+        // fork: copilul ruleaza build_segment (care la randul lui fork+execv ffmpeg)
         pid_t pid = fork();
         if (pid < 0) {
             overall = -1;
@@ -210,8 +201,7 @@ int worker_dispatch_merge(const video_ctx_t *ctx, const proto_merge_t *op)
     }
 
 cleanup_temps:
-    // Curata fisierele temporare rezultate din faza de segmentare.
-    // Acestea sunt artefacte intermediare, nu output final pt client.
+    // sterg fisierele temporare din faza de segmentare (artefacte intermediare)
     for (uint32_t ix = 0; ix < parts; ix++) {
         if (final_op.clips[ix][0] != '\0') {
             (void)remove(final_op.clips[ix]);

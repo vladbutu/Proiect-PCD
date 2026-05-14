@@ -17,8 +17,10 @@
 #include <errno.h> // errno, EINTR pt retry dupa semnale
 #include <netinet/in.h> // htonl/ntohl pt conversie network <-> host byte order
 #include <stddef.h> // size_t
+#include <stdint.h> // uint64_t pt size transferuri mari
 #include <sys/socket.h> // recv, send pt transfer pe socket
 #include <sys/types.h> // ssize_t
+#include <unistd.h> // read, write pt streaming din/in fisier
 
 // citeste exact len bytes de pe socket; reincearca daca recv e partial sau intrerupt
 int proto_read_full(int sock, void *buf, size_t len)
@@ -84,6 +86,61 @@ int proto_write_header(int sock, const proto_header_t *hdr)
     net.op_id = htonl(hdr->op_id);
     net.task_id = htonl(hdr->task_id);
     return proto_write_full(sock, &net, sizeof(net));
+}
+
+// Trimite size bytes de la fd_in pe socket. Streaming in chunks pt fisiere mari
+// (cateva sute MB). Folosesc proto_write_full pt chunk-uri ca sa nu pierd date.
+int proto_send_file(int sock, int fd_in, uint64_t size)
+{
+    unsigned char buf[PROTO_UPLOAD_CHUNK];
+    uint64_t left = size;
+
+    while (left > 0) {
+        size_t want = (left > sizeof(buf)) ? sizeof(buf) : (size_t)left;
+        ssize_t nread = read(fd_in, buf, want);
+        if (nread == 0) {
+            return -1; // EOF prematur
+        }
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (proto_write_full(sock, buf, (size_t)nread) < 0) {
+            return -1;
+        }
+        left -= (uint64_t)nread;
+    }
+    return 0;
+}
+
+// Primeste size bytes de pe socket si scrie in fd_out. Streaming, fara buffer mare.
+int proto_recv_file(int sock, int fd_out, uint64_t size)
+{
+    unsigned char buf[PROTO_UPLOAD_CHUNK];
+    uint64_t left = size;
+
+    while (left > 0) {
+        size_t want = (left > sizeof(buf)) ? sizeof(buf) : (size_t)left;
+        if (proto_read_full(sock, buf, want) < 0) {
+            return -1;
+        }
+        // scriere completa cu retry pe EINTR / partial
+        size_t written = 0;
+        while (written < want) {
+            ssize_t nwr = write(fd_out, buf + written, want - written);
+            if (nwr < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            written += (size_t)nwr;
+        }
+        left -= (uint64_t)want;
+    }
+    return 0;
 }
 
 /*

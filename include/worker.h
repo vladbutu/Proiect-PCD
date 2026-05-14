@@ -15,17 +15,13 @@
 
 #include <sys/types.h> // pid_t
 
-// ruleaza o comanda ffmpeg intr-un copil fork()-at
-// returneaza PID-ul copilului (>0) la succes, -1 la eroare
-// argv-ul e al caller-ului; e eliberat aici doar la eroare de fork
+// ruleaza ffmpeg intr-un copil fork-at; argv ramane in proprietatea caller-ului (PID >0 succes, -1 eroare)
 pid_t worker_spawn(const video_ctx_t *ctx, char **argv);
 
-// asteapta blocant un PID specific; returneaza 0 daca copilul a iesit cu 0, -1 altfel
+// asteapta blocant PID-ul (0 daca copilul a iesit cu 0, -1 altfel)
 int worker_wait(pid_t pid);
 
-// dispatch merge: imparte clipurile in ctx->merge_parallelism segmente,
-// fiecare procesat de propriul copil, apoi concateneaza rezultatele
-// returneaza 0 la succes, -1 la orice eroare
+// dispatch merge: imparte in ctx->merge_parallelism segmente paralele, apoi concateneaza
 int worker_dispatch_merge(const video_ctx_t *ctx,
                           const proto_merge_t *op);
 
