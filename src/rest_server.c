@@ -18,6 +18,9 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // pt strcasestr (Content-Length lookup) - inainte de orice include
+#endif
 
 #include "proto.h" // constante si structuri proto_*_t
 #include "getopt_compat.h" // declaratii getopt/optarg explicite
@@ -26,6 +29,9 @@
 
 #include <ctype.h> // isxdigit pt %XX decoding in query string
 #include <errno.h> // errno pt open/bind/listen/accept/strtol
+#include <fcntl.h> // open flags pt /upload si /download
+#include <strings.h> // strcasestr pt Content-Length case-insensitive
+#include <sys/stat.h> // mkdir, fstat pt /upload si /download
 #include <libconfig.h> // config_t, config_read_file -- lib extern obligatoriu
 #include <netinet/in.h> // sockaddr_in, htons, htonl pt IPv4 listen socket
 #include <stdint.h> // uint32_t pt mapare in structurile proto_*_t
@@ -50,6 +56,9 @@
 #define HTTP_OK 200 // cod HTTP succes
 #define HTTP_BAD_REQUEST 400 // cod HTTP request invalid
 #define END_MS_BUF_OFFSET 64 // offset in bufferul temporar pentru al doilea numar
+#define UPLOAD_CHUNK 65536 // chunk size pentru streaming /upload + /download
+#define DIR_MODE 0755 // permisiuni dir create de /upload
+#define FILE_MODE 0644 // permisiuni fisier create de /upload
 
 typedef struct rest_cfg {
     int listen_port; // portul pe care asculta shim-ul REST
@@ -365,6 +374,159 @@ static int run_merge(const video_ctx_t *ctx, char *query, char *out_path)
     return worker_dispatch_merge(ctx, &req);
 }
 
+// extrage Content-Length din buffer-ul de request. -1 daca lipseste/invalid.
+// nu pot folosi parse_int() pt ca acela cere *end='\0', dar aici urmeaza \r\n.
+static long parse_content_length(const char *req)
+{
+    const char *cl = strcasestr(req, "Content-Length:");
+    if (cl == NULL) {
+        return -1;
+    }
+    char *end = NULL;
+    errno = 0;
+    long val = strtol(cl + 15, &end, PARSE_INT_BASE);
+    if (errno != 0 || end == cl + 15 || val < 0) {
+        return -1;
+    }
+    return val;
+}
+
+// gaseste inceputul body-ului HTTP (dupa \r\n\r\n). Returneaza NULL daca lipseste.
+static const char *find_body(const char *req)
+{
+    const char *p = strstr(req, "\r\n\r\n");
+    return (p != NULL) ? (p + 4) : NULL;
+}
+
+// sanitize basename pt path: doar litere/cifre/._- ; refuza .. si /
+static int safe_basename(const char *raw, char *out, size_t out_sz)
+{
+    if (raw == NULL || raw[0] == '\0') {
+        return -1;
+    }
+    for (const char *p = raw; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            return -1;
+        }
+        if (*p == '.' && p[1] == '.') {
+            return -1;
+        }
+    }
+    (void)snprintf(out, out_sz, "%s", raw);
+    return 0;
+}
+
+// POST /upload?path=name.bin -- raw body in fisier in <uploads_dir>/incoming/
+static int run_upload(const video_ctx_t *ctx, char *query, const char *req_buf,
+                      ssize_t already_read, int cfd, char *stored_out)
+{
+    char fname[PROTO_MAX_PATH];
+    if (query_get(query, "path", fname, sizeof(fname)) < 0) {
+        return -1;
+    }
+    char safe[PROTO_MAX_PATH];
+    if (safe_basename(fname, safe, sizeof(safe)) < 0) {
+        return -1;
+    }
+    long clen = parse_content_length(req_buf);
+    if (clen < 0) {
+        return -1;
+    }
+    const char *body = find_body(req_buf);
+    if (body == NULL) {
+        return -1;
+    }
+
+    char dest_dir[PROTO_MAX_PATH];
+    (void)snprintf(dest_dir, sizeof(dest_dir), "%.400s/incoming", ctx->uploads_dir);
+    (void)mkdir(ctx->uploads_dir, DIR_MODE);
+    (void)mkdir(dest_dir, DIR_MODE);
+
+    char dest_path[PROTO_MAX_PATH];
+    (void)snprintf(dest_path, sizeof(dest_path), "%.400s/rest_%d_%.80s",
+                   dest_dir, (int)getpid(), safe);
+    int fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
+    if (fd < 0) {
+        return -1;
+    }
+
+    size_t header_len = (size_t)(body - req_buf);
+    ssize_t body_in_buf = already_read - (ssize_t)header_len;
+    if (body_in_buf > 0) {
+        if (write(fd, body, (size_t)body_in_buf) < 0) {
+            (void)close(fd);
+            return -1;
+        }
+    }
+    long left = clen - (body_in_buf > 0 ? body_in_buf : 0);
+    char buf[UPLOAD_CHUNK];
+    while (left > 0) {
+        size_t want = (left > (long)sizeof(buf)) ? sizeof(buf) : (size_t)left;
+        ssize_t n = read(cfd, buf, want);
+        if (n <= 0) {
+            (void)close(fd);
+            return -1;
+        }
+        if (write(fd, buf, (size_t)n) < 0) {
+            (void)close(fd);
+            return -1;
+        }
+        left -= n;
+    }
+    (void)close(fd);
+    (void)snprintf(stored_out, PROTO_MAX_PATH, "%s", dest_path);
+    return 0;
+}
+
+// GET /download?path=foo.mp4 -- citeste fisierul din outputs_dir si streameaza pe socket
+static int run_download(const video_ctx_t *ctx, char *query, int cfd)
+{
+    char fname[PROTO_MAX_PATH];
+    if (query_get(query, "path", fname, sizeof(fname)) < 0) {
+        return -1;
+    }
+    char safe[PROTO_MAX_PATH];
+    if (safe_basename(fname, safe, sizeof(safe)) < 0) {
+        return -1;
+    }
+    char src_path[PROTO_MAX_PATH];
+    (void)snprintf(src_path, sizeof(src_path), "%.400s/%.100s", ctx->outputs_dir, safe);
+    int fd = open(src_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        (void)close(fd);
+        return -1;
+    }
+    char hdr[RESP_BUF_SZ];
+    (void)snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: %lld\r\n"
+        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+        "Connection: close\r\n\r\n",
+        (long long)st.st_size, safe);
+    (void)write(cfd, hdr, strlen(hdr));
+    char buf[UPLOAD_CHUNK];
+    off_t left = st.st_size;
+    while (left > 0) {
+        size_t want = (left > (off_t)sizeof(buf)) ? sizeof(buf) : (size_t)left;
+        ssize_t n = read(fd, buf, want);
+        if (n <= 0) {
+            break;
+        }
+        if (write(cfd, buf, (size_t)n) < 0) {
+            (void)close(fd);
+            return -1;
+        }
+        left -= n;
+    }
+    (void)close(fd);
+    return 0;
+}
+
 // trateaza un client HTTP; request minim (metoda + target), fara keep-alive
 static void handle_client(int cfd, const video_ctx_t *ctx)
 {
@@ -400,8 +562,29 @@ static void handle_client(int cfd, const video_ctx_t *ctx)
         return;
     }
 
+    // /download e GET cu query, separat de POST-urile de procesare
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/download") == 0 && query != NULL) {
+        if (run_download(ctx, query, cfd) < 0) {
+            send_json(cfd, HTTP_BAD_REQUEST, "{\"status\":\"error\",\"message\":\"file not found\"}");
+        }
+        return;
+    }
+
     if (strcmp(method, "POST") != 0 || query == NULL) {
         send_json(cfd, HTTP_BAD_REQUEST, "{\"status\":\"error\",\"message\":\"unsupported endpoint\"}");
+        return;
+    }
+
+    // /upload streameaza body raw; nu trece prin runner-ele ffmpeg
+    if (strcmp(path, "/upload") == 0) {
+        char stored[PROTO_MAX_PATH];
+        if (run_upload(ctx, query, req, nread, cfd, stored) < 0) {
+            send_json(cfd, HTTP_BAD_REQUEST, "{\"status\":\"error\",\"message\":\"upload failed\"}");
+            return;
+        }
+        char json[RESP_BUF_SZ];
+        (void)snprintf(json, sizeof(json), "{\"status\":\"ok\",\"stored\":\"%s\"}", stored);
+        send_json(cfd, HTTP_OK, json);
         return;
     }
 

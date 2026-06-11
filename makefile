@@ -35,7 +35,7 @@ REST_BIN    = $(BINDIR)/vps_rest
 # Compat: vps_client e alias catre vps_admin (clientii vechi)
 CLIENT_BIN  = $(BINDIR)/vps_client
 
-.PHONY: all clean tidy help dirs server client rest asan tsan
+.PHONY: all clean tidy help dirs server client rest asan tsan wstest pyclient capture
 
 all: dirs $(SERVER_BIN) $(ADMIN_BIN) $(REMOTE_BIN) $(REST_BIN)
 
@@ -119,6 +119,16 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 
 tidy:
 	clang-tidy $(SRCDIR)/*.c -- $(CFLAGS)
+
+# Milestone 3: client OTH (Python) + tester REST + captura Wireshark
+pyclient:
+	@python3 -m py_compile clients/python/vps_remote.py && echo "pyclient ok"
+
+wstest:
+	python3 clients/python/vps_rest_test.py --base http://127.0.0.1:18082
+
+capture:
+	./scripts/wireshark_capture.sh
 
 clean:
 	rm -rf $(BUILDDIR) $(BINDIR)

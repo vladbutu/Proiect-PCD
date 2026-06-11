@@ -24,7 +24,8 @@
 #include <stdio.h> // fprintf, snprintf pt output catre user
 #include <stdlib.h> // EXIT_SUCCESS/EXIT_FAILURE, strtol
 #include <string.h> // memset, strcmp, strerror pt CLI dispatch
-#include <sys/socket.h> // socket, connect pt TCP catre vps_server
+#include <sys/socket.h> // socket, connect pt TCP/UNIX catre vps_server
+#include <sys/un.h> // sockaddr_un pt AF_UNIX (admin local pe /tmp/vps_admin.sock)
 #include <unistd.h> // close, getpid (task_id local)
 
 #define DEFAULT_HOST "127.0.0.1"
@@ -37,6 +38,7 @@ typedef struct cli_args {
     int port;
     const char *cmd;
     uint32_t task_id;
+    const char *unix_path; // daca non-NULL, conecteaza AF_UNIX in loc de TCP
 } cli_args_t;
 
 static void usage(const char *argv0)
@@ -49,15 +51,38 @@ static void usage(const char *argv0)
         "  status <task_id>  raporteaza starea unui task\n"
         "  list              afiseaza joburile din tabela serverului\n"
         "  stats             contoare server (uptime, done, failed)\n"
+        "  info              identitate server (version, build, pid, uptime)\n"
         "  shutdown          opreste serverul (gracios)\n"
         "Options:\n"
         "  -H <host>         host server (default: %s)\n"
-        "  -P <port>         port server (default: %d)\n",
+        "  -P <port>         port server (default: %d)\n"
+        "  -U <path>         conecteaza pe AF_UNIX (ex: /tmp/vps_admin.sock)\n",
         argv0, DEFAULT_HOST, DEFAULT_PORT);
+}
+
+// conecteaza pe AF_UNIX la calea data (folosit cu -U)
+static int dial_unix(const char *path)
+{
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        (void)close(sock);
+        return -1;
+    }
+    return sock;
 }
 
 static int dial(const cli_args_t *args)
 {
+    if (args->unix_path != NULL) {
+        return dial_unix(args->unix_path);
+    }
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -206,6 +231,25 @@ static int cmd_stats(int sock)
     return 0;
 }
 
+static int cmd_info(int sock)
+{
+    if (send_simple(sock, OPR_INFO, NULL, 0) < 0) {
+        return -1;
+    }
+    proto_header_t rep;
+    if (proto_read_header(sock, &rep) < 0) {
+        return -1;
+    }
+    proto_info_reply_t ri;
+    if (proto_read_full(sock, &ri, sizeof(ri)) < 0) {
+        return -1;
+    }
+    (void)fprintf(stdout, "server version=%s build=%s pid=%u uptime=%us\n",
+                  ri.version, ri.build_date,
+                  ntohl(ri.pid), ntohl(ri.uptime_sec));
+    return 0;
+}
+
 static int cmd_shutdown(int sock)
 {
     if (send_simple(sock, OPR_SHUTDOWN, NULL, 0) < 0) {
@@ -241,10 +285,11 @@ int main(int argc, char **argv)
     args.port = DEFAULT_PORT;
 
     int opt;
-    while ((opt = getopt(argc, argv, "H:P:h")) != -1) {
+    while ((opt = getopt(argc, argv, "H:P:U:h")) != -1) {
         switch (opt) {
             case 'H': args.host = optarg; break;
             case 'P': args.port = parse_int_safe(optarg, DEFAULT_PORT); break;
+            case 'U': args.unix_path = optarg; break;
             case 'h': usage(argv[0]); return EXIT_SUCCESS;
             default:  usage(argv[0]); return EXIT_FAILURE;
         }
@@ -278,6 +323,8 @@ int main(int argc, char **argv)
         rc = cmd_list(sock);
     } else if (strcmp(args.cmd, "stats") == 0) {
         rc = cmd_stats(sock);
+    } else if (strcmp(args.cmd, "info") == 0) {
+        rc = cmd_info(sock);
     } else if (strcmp(args.cmd, "shutdown") == 0) {
         rc = cmd_shutdown(sock);
     } else {

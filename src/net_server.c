@@ -1,7 +1,6 @@
 /**
  * Echipa 11 · IR3 2026 · PCD
- * Server TCP cu poll() (Nivel A: I/O multiplexing).
- * Refactorizat in milestone 2 pt:
+ * Server TCP cu poll() (I/O multiplexing).
  *  - coada de joburi async: fork()+execv() pt ffmpeg, raspunde imediat cu task_id
  *  - operatii admin (UX): PING, LIST_JOBS, STATS, SHUTDOWN
  *  - transfer fisiere (REMOTE/IN): UPLOAD / DOWNLOAD streaming pe socket
@@ -29,6 +28,8 @@
 #include <libgen.h> // basename pt sanitize_basename (anti path traversal)
 #include <netinet/in.h> // sockaddr_in, htons, htonl pt IPv4 listen
 #include <signal.h> // sigaction, sig_atomic_t pt SIGINT/SIGTERM/SIGPIPE
+#include <sys/inotify.h> // inotify_init1/add_watch pt watch outputs_dir
+#include <sys/un.h> // sockaddr_un pt AF_UNIX (admin local)
 #include <stdint.h> // uint16_t, uint32_t pt campuri protocol
 #include <stdio.h> // fprintf, snprintf pt log si paths
 #include <stdlib.h> // calloc/free pt vectorul de pollfd
@@ -264,6 +265,18 @@ static int handle_shutdown(int sock, const proto_header_t *hdr)
     return rc;
 }
 
+// OPR_INFO: identitate server pt admin (M3) - version/build/pid/uptime
+static int handle_info(int sock, jobs_table_t *jobs, const proto_header_t *hdr)
+{
+    proto_info_reply_t rep;
+    memset(&rep, 0, sizeof(rep));
+    (void)snprintf(rep.version, sizeof(rep.version), "echipa11-m3");
+    (void)snprintf(rep.build_date, sizeof(rep.build_date), "%s", __DATE__);
+    rep.pid = htonl((uint32_t)getpid());
+    rep.uptime_sec = htonl((uint32_t)(time(NULL) - jobs->started_at));
+    return reply_with(sock, hdr, OPR_INFO, &rep, sizeof(rep));
+}
+
 // ---------- File transfer (REMOTE/IN): UPLOAD / DOWNLOAD ----------
 
 // extrage doar basename-ul fara directoare, ca sa nu permit path traversal
@@ -380,6 +393,8 @@ static int handle_download(int sock, const video_ctx_t *vctx, const proto_header
 
 // ---------- Listener & dispatch ----------
 
+#define VPS_UNIX_PATH "/tmp/vps_admin.sock"
+
 static int open_listener(int port)
 {
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -407,6 +422,64 @@ static int open_listener(int port)
     return sfd;
 }
 
+// AF_UNIX listener pt admin local (cerinta UX socket M3). Path: /tmp/vps_admin.sock
+static int open_unix_listener(const char *path)
+{
+    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sfd < 0) {
+        return -1;
+    }
+    (void)unlink(path); // sterg socketul orfan dintr-o rulare anterioara
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        (void)close(sfd);
+        return -1;
+    }
+    if (listen(sfd, LISTEN_BACKLOG) < 0) {
+        (void)close(sfd);
+        return -1;
+    }
+    return sfd;
+}
+
+// INotify pt outputs_dir: notifica in log cand un job termina si scrie fisierul
+static int open_inotify_watch(const char *outputs_dir)
+{
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (ifd < 0) {
+        return -1;
+    }
+    int wd = inotify_add_watch(ifd, outputs_dir, IN_CLOSE_WRITE | IN_CREATE);
+    if (wd < 0) {
+        (void)close(ifd);
+        return -1;
+    }
+    return ifd;
+}
+
+// citeste si raporteaza evenimentele inotify acumulate (fara block)
+static void drain_inotify(int ifd)
+{
+    char buf[4096] __attribute__((aligned(8)));
+    for (;;) {
+        ssize_t n = read(ifd, buf, sizeof(buf));
+        if (n <= 0) {
+            return;
+        }
+        for (ssize_t off = 0; off < n; ) {
+            const struct inotify_event *ev = (const struct inotify_event *)(buf + off);
+            if (ev->len > 0) {
+                const char *kind = (ev->mask & IN_CLOSE_WRITE) ? "CLOSE_WRITE" : "CREATE";
+                (void)fprintf(stderr, "vps_server: inotify %s outputs/%s\n", kind, ev->name);
+            }
+            off += (ssize_t)(sizeof(*ev) + ev->len);
+        }
+    }
+}
+
 static int dispatch_one(int sock, const video_ctx_t *vctx, jobs_table_t *jobs)
 {
     proto_header_t hdr;
@@ -429,6 +502,7 @@ static int dispatch_one(int sock, const video_ctx_t *vctx, jobs_table_t *jobs)
         case OPR_PING:        return handle_ping(sock, &hdr);
         case OPR_LIST_JOBS:   return handle_list_jobs(sock, jobs, &hdr);
         case OPR_STATS:       return handle_stats(sock, jobs, &hdr);
+        case OPR_INFO:        return handle_info(sock, jobs, &hdr);
         case OPR_SHUTDOWN:    return handle_shutdown(sock, &hdr);
         case OPR_UPLOAD:      return handle_upload(sock, vctx, &hdr);
         case OPR_DOWNLOAD:    return handle_download(sock, vctx, &hdr);
@@ -484,16 +558,42 @@ int net_server_run(const server_cfg_t *cfg)
         (void)fprintf(stderr, "net_server: listener open failed\n");
         return -1;
     }
+    int unix_fd = open_unix_listener(VPS_UNIX_PATH);
+    if (unix_fd < 0) {
+        (void)fprintf(stderr, "net_server: unix listener open failed (continui doar pe INET)\n");
+    }
+    int inotify_fd = open_inotify_watch(cfg->video.outputs_dir);
+    if (inotify_fd < 0) {
+        (void)fprintf(stderr, "net_server: inotify init failed (continui fara watch)\n");
+    }
 
-    nfds_t limit = (nfds_t)cfg->max_clients + 1U;
+    // sloturi pollfd: +1 INET, +1 UNIX, +1 inotify, +max_clients pt sesiuni
+    nfds_t limit = (nfds_t)cfg->max_clients + 3U;
     struct pollfd *fds = (struct pollfd *)calloc((size_t)limit, sizeof(struct pollfd));
     if (fds == NULL) {
         (void)close(listen_fd);
+        if (unix_fd >= 0) { (void)close(unix_fd); }
+        if (inotify_fd >= 0) { (void)close(inotify_fd); }
         return -1;
     }
     fds[0].fd = listen_fd;
     fds[0].events = POLLIN;
     nfds_t nfds = 1;
+    nfds_t unix_ix = 0;
+    nfds_t inotify_ix = 0;
+    if (unix_fd >= 0) {
+        fds[nfds].fd = unix_fd;
+        fds[nfds].events = POLLIN;
+        unix_ix = nfds;
+        nfds++;
+    }
+    if (inotify_fd >= 0) {
+        fds[nfds].fd = inotify_fd;
+        fds[nfds].events = POLLIN;
+        inotify_ix = nfds;
+        nfds++;
+    }
+    nfds_t sessions_start = nfds; // primul slot dedicat sesiunilor (peste listenere/inotify)
 
     // Cleanup config (0 din libconfig -> default). outputs/ NU este atins.
     unsigned ret_sec = (cfg->jobs_retention_sec > 0)
@@ -507,6 +607,12 @@ int net_server_run(const server_cfg_t *cfg)
     (void)fprintf(stderr,
         "vps_server: listening on port %d (max_clients=%d, jobs_retention=%us)\n",
         cfg->listen_port, cfg->max_clients, ret_sec);
+    if (unix_fd >= 0) {
+        (void)fprintf(stderr, "vps_server: also listening on AF_UNIX %s\n", VPS_UNIX_PATH);
+    }
+    if (inotify_fd >= 0) {
+        (void)fprintf(stderr, "vps_server: inotify watch active on %s\n", cfg->video.outputs_dir);
+    }
 
     while (g_stop == 0) {
         int ready = poll(fds, nfds, POLL_TIMEOUT_MS);
@@ -538,7 +644,13 @@ int net_server_run(const server_cfg_t *cfg)
         if ((fds[0].revents & POLLIN) != 0) {
             accept_new_client(listen_fd, fds, &nfds, limit);
         }
-        for (nfds_t ix = 1; ix < nfds; ix++) {
+        if (unix_ix != 0 && (fds[unix_ix].revents & POLLIN) != 0) {
+            accept_new_client(unix_fd, fds, &nfds, limit);
+        }
+        if (inotify_ix != 0 && (fds[inotify_ix].revents & POLLIN) != 0) {
+            drain_inotify(inotify_fd);
+        }
+        for (nfds_t ix = sessions_start; ix < nfds; ix++) {
             if ((fds[ix].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
                 continue;
             }
@@ -556,6 +668,9 @@ int net_server_run(const server_cfg_t *cfg)
         (void)close(fds[ix].fd);
     }
     free(fds);
+    if (unix_fd >= 0) {
+        (void)unlink(VPS_UNIX_PATH);
+    }
     jobs_destroy(&jobs);
     return 0;
 }

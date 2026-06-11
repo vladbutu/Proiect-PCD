@@ -6,12 +6,13 @@ Aplicatie pentru operatii video (trim, filtre, imbinare cu tranzitii, sunet de f
 cu distributia task-urilor in procese fiu, integrare biblioteca externa (FFmpeg) si
 transfer de fisiere bidirectional intre client si server.
 
-> Versiunea Milestone 2. Diff fata de Milestone 1:
-> - separare client ADMIN (UX, maintenance) vs client REMOTE (IN, transfer fisiere)
-> - protocol UPLOAD / DOWNLOAD (streaming, suporta cateva sute MB)
-> - coada de joburi async + STATUS / RESULT functional
-> - operatii admin: PING, LIST_JOBS, STATS, SHUTDOWN
-> - SRS si SDD livrate ca documente separate (mai standard formal)
+> Versiunea Milestone 3. Diff fata de Milestone 2:
+> - listener AF_UNIX paralel pe `/tmp/vps_admin.sock` (cerinta UX socket)
+> - INotify watcher pe `outputs_dir` (notificare finalizare joburi)
+> - REST extins: `POST /upload` si `GET /download` (transfer fisiere bidirectional)
+> - OPR_INFO (handshake admin: version, build, pid, uptime)
+> - client REMOTE in alt limbaj (Python, in `clients/python/vps_remote.py`)
+> - captura + analiza Wireshark documentata in `docs/WIRESHARK.md`
 
 ---
 
@@ -59,8 +60,12 @@ state-ul jobului asincron.
 | 7 | STATUS / RESULT raporteaza starea unui task | Must | OK |
 | 8 | UPLOAD: client trimite fisier streaming pe socket | Must | OK |
 | 9 | DOWNLOAD: client primeste fisier streaming de pe server | Must | OK |
-| 10 | Admin ops: PING, LIST_JOBS, STATS, SHUTDOWN | Should | OK |
+| 10 | Admin ops: PING, LIST_JOBS, STATS, SHUTDOWN, INFO | Should | OK |
 | 11 | REST shim cu `/health` + trim/filter/merge/mixaudio | Should | OK |
+| 12 | Listener AF_UNIX paralel pt admin local | M3 | OK |
+| 13 | INotify watcher pe `outputs_dir` (cerinta INotify) | M3 | OK |
+| 14 | REST: `POST /upload` + `GET /download` (transfer fisiere) | M3 | OK |
+| 15 | Client REMOTE in alt limbaj (Python, paritate cu cel C) | M3 | OK |
 
 ### 4.2 Client ADMIN (UX)
 
@@ -71,6 +76,7 @@ state-ul jobului asincron.
 | 3 | list | toata tabela de joburi |
 | 4 | stats | contoare server (uptime, done, failed) |
 | 5 | shutdown | comanda graceful exit pt server |
+| 6 | info | identitate server (version + build + pid + uptime) |
 
 Clientul ADMIN nu face transfer de fisiere (conform cerintei de proiect).
 

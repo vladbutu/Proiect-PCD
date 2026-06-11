@@ -2,10 +2,10 @@
  * Echipa 11 · IR3 2026 · PCD
  * vps_remote: clientul REMOTE (IN) cu transfer fisiere bidirectional
  * Workflow tipic pentru o operatie video:
- *   1. UPLOAD: trimite fisierele locale (input + opt audio + opt clipuri)
- *   2. SUBMIT: cere serverului sa proceseze, primeste task_id
- *   3. POLL:   intreaba STATUS pana state == DONE / ERR
- *   4. DOWNLOAD: descarca rezultatul local
+ *   1. UPLOAD trimite fisierele locale (input + opt audio + opt clipuri)
+ *   2. SUBMIT cere serverului sa proceseze, primeste task_id
+ *   3. PPOLL intreaba STATUS pana state == DONE / ERR
+ *   4. DOWNLOAD descarca rezultatul local
  *
  * Operatii suportate: trim, filter, merge, mixaudio.
  * Asta acopera 4/6 din operatiile SRS (>70%, prag obligatoriu in milestone 2).

@@ -1,6 +1,6 @@
 # Multi-Video Operations — SDD (Software Design Document)
 
-**Echipa 11 · IR3 2026 · PCD · Milestone 2 (preliminar)**
+**Echipa 11 · IR3 2026 · PCD · Milestone 3**
 
 Acest document descrie design-ul tehnic care implementeaza cerintele din `SRS.md`.
 
@@ -70,6 +70,7 @@ Header fix 16 bytes, network byte order:
 | 11 | STATS | admin | ADMIN |
 | 12 | UPLOAD | transfer | client→server (REMOTE) |
 | 13 | DOWNLOAD | transfer | server→client (REMOTE) |
+| 14 | INFO | admin | ADMIN (M3: version, build, pid, uptime) |
 
 ### 3.3 Payload-uri principale
 
@@ -249,3 +250,45 @@ bin/vps_remote -o mixaudio -i data/uploads/clip1.mp4 -a data/uploads/background.
 - schelet client REMOTE in alt limbaj (Python/Java/Go)
 - WebServices REST extinse + testare cu tool / client HTTP
 - fisiere mari (1+ GB) + benchmarks
+
+## 13. Adaugiri M3 (livrate)
+
+### 13.1 Socket UX (AF_UNIX) pentru admin local
+
+Serverul deschide un listener suplimentar AF_UNIX la `/tmp/vps_admin.sock` in
+paralel cu cel AF_INET pe 18081. Ambele sunt incluse in aceeasi bucla `poll()`
+si folosesc acelasi dispatcher de protocol -- diferenta e doar familia socket-ului.
+
+Beneficiu: admin-ul pe acelasi host evita stack-ul TCP/IP si nu deschide porturi
+catre exterior. Clientul `vps_admin -U /tmp/vps_admin.sock <cmd>` se conecteaza
+direct la socket-ul UNIX.
+
+### 13.2 INotify watcher pe `outputs_dir`
+
+`inotify_init1(IN_NONBLOCK | IN_CLOEXEC)` + `inotify_add_watch(... IN_CLOSE_WRITE | IN_CREATE)`.
+Descriptor-ul e inclus in poll() ca al treilea listener. La fiecare eveniment se
+loggheaza `CLOSE_WRITE` / `CREATE` cu numele fisierului -- folosit pentru
+notificare de finalizare a operatiilor video (cand ffmpeg termina si scrie rezultatul).
+
+### 13.3 REST: transfer fisiere bidirectional
+
+`POST /upload?path=name.bin` -- body raw HTTP, salvat in
+`<uploads_dir>/incoming/rest_<pid>_<name>`. Header `Content-Length` obligatoriu.
+
+`GET /download?path=file.mp4` -- streameaza din `<outputs_dir>` cu header
+`Content-Length` + `Content-Disposition`. Path-uri sanitizate (refuz `/`, `\\`, `..`).
+
+### 13.4 OPR_INFO (handshake admin extins)
+
+Returneaza `proto_info_reply_t { version[32], build_date[32], pid, uptime_sec }`.
+PID si uptime in network byte order; strings ca text simplu.
+
+### 13.5 Client OTH (Python)
+
+`clients/python/vps_remote.py` acopera toate cele 11 operatii (admin + remote +
+transfer fisiere). Stdlib doar. Suporta `-U` pentru AF_UNIX, identic cu admin-ul C.
+
+### 13.6 Captura Wireshark
+
+`scripts/wireshark_capture.sh` + `docs/WIRESHARK.md` -- captura 30s pe loopback,
+ghid de demo cu filtre Wireshark, decodare header binar, analiza HTTP REST.

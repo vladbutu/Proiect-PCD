@@ -30,6 +30,8 @@
 // ---- File transfer ops (REMOTE, IN) ----
 #define OPR_UPLOAD 12 // client trimite un fisier catre server
 #define OPR_DOWNLOAD 13 // client cere un fisier de pe server
+// ---- Admin ops adaugate la M3 ----
+#define OPR_INFO 14 // version + build_date + pid + uptime (handshake admin)
 
 // Stari task in proto_status_t.state
 #define TASK_STATE_QUEUED  0 // in coada, neinceput
@@ -43,7 +45,7 @@
 #define PROTO_MAX_MSG 4096 // dimensiune maxima mesaj
 #define PROTO_LIST_MAX_JOBS 32 // max joburi in raspunsul LIST_JOBS
 
-// Chunk size pentru transferul streaming de fisiere (cateva sute MB realiste)
+// Chunk size pentru transferul streaming de fisiere 
 #define PROTO_UPLOAD_CHUNK (64U * 1024U)
 
 
@@ -134,6 +136,16 @@ typedef struct proto_list_jobs_reply {
     uint32_t count;
     proto_job_entry_t jobs[PROTO_LIST_MAX_JOBS];
 } proto_list_jobs_reply_t;
+
+// OPR_INFO reply: identitate server pt admin (version + build + pid + uptime)
+#define PROTO_INFO_STR 32
+
+typedef struct proto_info_reply {
+    char     version[PROTO_INFO_STR];
+    char     build_date[PROTO_INFO_STR];
+    uint32_t pid;
+    uint32_t uptime_sec;
+} proto_info_reply_t;
 
 // OPR_STATS reply: contoare server
 typedef struct proto_stats_reply {

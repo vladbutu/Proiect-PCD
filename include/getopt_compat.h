@@ -1,10 +1,7 @@
 /**
  * Echipa 11
  * IR3 2026
- * Proiect PCD - Compatibilitate getopt pentru analiza statica (clang-tidy)
- * Unele configuratii cu macro-uri POSIX stricte pot face ca analiza sa nu
- * asocieze corect simbolurile getopt/optarg cu headerele glibc. Headerul
- * acesta centralizeaza declaratiile folosite de client/server.
+ * Proiect PCD - Compatibilitate getopt pentru analiza statica.
  */
 
 #ifndef GETOPT_COMPAT_H
