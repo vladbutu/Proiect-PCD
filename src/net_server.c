@@ -16,6 +16,9 @@
 // permisiuni standard pt directoarele/fisierele scrise de server
 #define DIR_MODE_DEFAULT  0755
 #define FILE_MODE_DEFAULT 0644
+// buffer pt citirea evenimentelor inotify (aliniat pt struct inotify_event)
+#define INOTIFY_BUF_SIZE  4096
+#define INOTIFY_BUF_ALIGN 8
 
 #include "net_server.h" // server_cfg_t + net_server_run()
 #include "proto.h" // header binar, payload-uri, helpers I/O
@@ -463,13 +466,13 @@ static int open_inotify_watch(const char *outputs_dir)
 // citeste si raporteaza evenimentele inotify acumulate (fara block)
 static void drain_inotify(int ifd)
 {
-    char buf[4096] __attribute__((aligned(8)));
+    char buf[INOTIFY_BUF_SIZE] __attribute__((aligned(INOTIFY_BUF_ALIGN)));
     for (;;) {
-        ssize_t n = read(ifd, buf, sizeof(buf));
-        if (n <= 0) {
+        ssize_t nread = read(ifd, buf, sizeof(buf));
+        if (nread <= 0) {
             return;
         }
-        for (ssize_t off = 0; off < n; ) {
+        for (ssize_t off = 0; off < nread; ) {
             const struct inotify_event *ev = (const struct inotify_event *)(buf + off);
             if (ev->len > 0) {
                 const char *kind = (ev->mask & IN_CLOSE_WRITE) ? "CLOSE_WRITE" : "CREATE";
@@ -539,6 +542,38 @@ static void accept_new_client(int listen_fd, struct pollfd *fds,
         (*nfds)++;
     } else {
         (void)close(client_fd);
+    }
+}
+
+// sweep periodic: elibereaza sloturi vechi + sterge duplicate din incoming/
+static void run_cleanup_sweep(jobs_table_t *jobs, unsigned ret_sec,
+                              const char *incoming_dir, const char *uploads_dir)
+{
+    unsigned freed = jobs_evict_old(jobs, ret_sec);
+    unsigned dups = cleanup_incoming_duplicates(incoming_dir, uploads_dir);
+    if (freed != 0U || dups != 0U) {
+        (void)fprintf(stderr,
+            "vps_server: cleanup slots_freed=%u dup_removed=%u\n",
+            freed, dups);
+    }
+}
+
+// proceseaza fd-urile de sesiune gata de I/O; compacteaza vectorul la inchidere
+static void service_session_fds(struct pollfd *fds, nfds_t *nfds,
+                                nfds_t sessions_start,
+                                const video_ctx_t *vctx, jobs_table_t *jobs)
+{
+    for (nfds_t ix = sessions_start; ix < *nfds; ix++) {
+        if ((fds[ix].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+            continue;
+        }
+        int sock = fds[ix].fd;
+        if (dispatch_one(sock, vctx, jobs) < 0) {
+            (void)close(sock);
+            fds[ix] = fds[*nfds - 1];
+            (*nfds)--;
+            ix--;
+        }
     }
 }
 
@@ -621,14 +656,7 @@ int net_server_run(const server_cfg_t *cfg)
         // sweep cleanup: elibereaza sloturi vechi + sterge duplicate din incoming/ (outputs/ neatins)
         time_t now = time(NULL);
         if ((now - last_cleanup) >= CLEANUP_INTERVAL_SEC) {
-            unsigned freed = jobs_evict_old(&jobs, ret_sec);
-            unsigned dups = cleanup_incoming_duplicates(incoming_dir,
-                                                       cfg->video.uploads_dir);
-            if (freed != 0U || dups != 0U) {
-                (void)fprintf(stderr,
-                    "vps_server: cleanup slots_freed=%u dup_removed=%u\n",
-                    freed, dups);
-            }
+            run_cleanup_sweep(&jobs, ret_sec, incoming_dir, cfg->video.uploads_dir);
             last_cleanup = now;
         }
 
@@ -650,18 +678,7 @@ int net_server_run(const server_cfg_t *cfg)
         if (inotify_ix != 0 && (fds[inotify_ix].revents & POLLIN) != 0) {
             drain_inotify(inotify_fd);
         }
-        for (nfds_t ix = sessions_start; ix < nfds; ix++) {
-            if ((fds[ix].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
-                continue;
-            }
-            int sock = fds[ix].fd;
-            if (dispatch_one(sock, &cfg->video, &jobs) < 0) {
-                (void)close(sock);
-                fds[ix] = fds[nfds - 1];
-                nfds--;
-                ix--;
-            }
-        }
+        service_session_fds(fds, &nfds, sessions_start, &cfg->video, &jobs);
     }
 
     for (nfds_t ix = 0; ix < nfds; ix++) {

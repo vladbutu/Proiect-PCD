@@ -18,9 +18,6 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE // pt strcasestr (Content-Length lookup) - inainte de orice include
-#endif
 
 #include "proto.h" // constante si structuri proto_*_t
 #include "getopt_compat.h" // declaratii getopt/optarg explicite
@@ -30,7 +27,6 @@
 #include <ctype.h> // isxdigit pt %XX decoding in query string
 #include <errno.h> // errno pt open/bind/listen/accept/strtol
 #include <fcntl.h> // open flags pt /upload si /download
-#include <strings.h> // strcasestr pt Content-Length case-insensitive
 #include <sys/stat.h> // mkdir, fstat pt /upload si /download
 #include <libconfig.h> // config_t, config_read_file -- lib extern obligatoriu
 #include <netinet/in.h> // sockaddr_in, htons, htonl pt IPv4 listen socket
@@ -378,14 +374,16 @@ static int run_merge(const video_ctx_t *ctx, char *query, char *out_path)
 // nu pot folosi parse_int() pt ca acela cere *end='\0', dar aici urmeaza \r\n.
 static long parse_content_length(const char *req)
 {
-    const char *cl = strcasestr(req, "Content-Length:");
+    static const char hdr_name[] = "Content-Length:";
+    const char *cl = strcasestr(req, hdr_name);
     if (cl == NULL) {
         return -1;
     }
+    const char *num = cl + (sizeof(hdr_name) - 1);
     char *end = NULL;
     errno = 0;
-    long val = strtol(cl + 15, &end, PARSE_INT_BASE);
-    if (errno != 0 || end == cl + 15 || val < 0) {
+    long val = strtol(num, &end, PARSE_INT_BASE);
+    if (errno != 0 || end == num || val < 0) {
         return -1;
     }
     return val;
@@ -394,8 +392,8 @@ static long parse_content_length(const char *req)
 // gaseste inceputul body-ului HTTP (dupa \r\n\r\n). Returneaza NULL daca lipseste.
 static const char *find_body(const char *req)
 {
-    const char *p = strstr(req, "\r\n\r\n");
-    return (p != NULL) ? (p + 4) : NULL;
+    const char *pos = strstr(req, "\r\n\r\n");
+    return (pos != NULL) ? (pos + 4) : NULL;
 }
 
 // sanitize basename pt path: doar litere/cifre/._- ; refuza .. si /
@@ -404,11 +402,11 @@ static int safe_basename(const char *raw, char *out, size_t out_sz)
     if (raw == NULL || raw[0] == '\0') {
         return -1;
     }
-    for (const char *p = raw; *p; p++) {
-        if (*p == '/' || *p == '\\') {
+    for (const char *pc = raw; *pc; pc++) {
+        if (*pc == '/' || *pc == '\\') {
             return -1;
         }
-        if (*p == '.' && p[1] == '.') {
+        if (*pc == '.' && pc[1] == '.') {
             return -1;
         }
     }
@@ -462,16 +460,16 @@ static int run_upload(const video_ctx_t *ctx, char *query, const char *req_buf,
     char buf[UPLOAD_CHUNK];
     while (left > 0) {
         size_t want = (left > (long)sizeof(buf)) ? sizeof(buf) : (size_t)left;
-        ssize_t n = read(cfd, buf, want);
-        if (n <= 0) {
+        ssize_t nread = read(cfd, buf, want);
+        if (nread <= 0) {
             (void)close(fd);
             return -1;
         }
-        if (write(fd, buf, (size_t)n) < 0) {
+        if (write(fd, buf, (size_t)nread) < 0) {
             (void)close(fd);
             return -1;
         }
-        left -= n;
+        left -= nread;
     }
     (void)close(fd);
     (void)snprintf(stored_out, PROTO_MAX_PATH, "%s", dest_path);
@@ -513,15 +511,15 @@ static int run_download(const video_ctx_t *ctx, char *query, int cfd)
     off_t left = st.st_size;
     while (left > 0) {
         size_t want = (left > (off_t)sizeof(buf)) ? sizeof(buf) : (size_t)left;
-        ssize_t n = read(fd, buf, want);
-        if (n <= 0) {
+        ssize_t nread = read(fd, buf, want);
+        if (nread <= 0) {
             break;
         }
-        if (write(cfd, buf, (size_t)n) < 0) {
+        if (write(cfd, buf, (size_t)nread) < 0) {
             (void)close(fd);
             return -1;
         }
-        left -= n;
+        left -= nread;
     }
     (void)close(fd);
     return 0;

@@ -31,3 +31,8 @@ CheckOptions:
     value: '2'
   - key: readability-function-cognitive-complexity.Threshold
     value: '40'
+  # include-cleaner traseaza macro-urile POSIX (SOL_SOCKET, SO_REUSEADDR) catre
+  # headere interne glibc (bits/, asm-generic/) in loc de <sys/socket.h> public;
+  # ignoram acele headere interne pt a evita fals-pozitivele.
+  - key: misc-include-cleaner.IgnoreHeaders
+    value: 'bits/.*;asm-generic/.*'

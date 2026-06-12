@@ -3,7 +3,7 @@
 
 CC        = gcc
 CSTD      = -std=c11
-CDEFS     = -D_POSIX_C_SOURCE=200809L
+CDEFS     = -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 CWARN     = -Wall -Wextra -Wpedantic -Werror
 CDEBUG    = -g
 CFLAGS    = $(CSTD) $(CDEFS) $(CWARN) $(CDEBUG) -Iinclude
